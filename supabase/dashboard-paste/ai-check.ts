@@ -34,7 +34,7 @@ function claudeHeaders(key) {
   if (ws) h["anthropic-workspace-id"] = ws.trim();
   return h;
 }
-async function askClaudeJson(prompt, opts) {
+async function askClaudeJson(prompt, opts, attachments = []) {
   const key = Deno.env.get("ANTHROPIC_API_KEY");
   if (!key) throw new HttpError(500, "Claude is not set up: add the ANTHROPIC_API_KEY secret in Supabase.");
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -43,7 +43,7 @@ async function askClaudeJson(prompt, opts) {
     body: JSON.stringify({
       model: opts.model,
       max_tokens: opts.maxTokens,
-      messages: [{ role: "user", content: prompt + "\n\nReply with the JSON object only \u2014 no other text." }]
+      messages: [{ role: "user", content: attachments.length ? [...attachments, { type: "text", text: prompt + "\n\nReply with the JSON object only \u2014 no other text." }] : prompt + "\n\nReply with the JSON object only \u2014 no other text." }]
     })
   });
   if (!res.ok) {
@@ -80,46 +80,86 @@ function parseJson(text) {
 }
 var RATINGS = ["Result-oriented", "Partly result-oriented", "Activity only"];
 var str = (v, max = 600) => String(v ?? "").slice(0, max);
-var strArr = (v, n) => Array.isArray(v) ? v.slice(0, n).map((x) => str(x, 400)) : [];
 
 // supabase/functions/_shared/ai.ts
-async function checkSheet(b, maxFlags = 8) {
-  const prompt = `You review a weekly KPI result sheet that a Head of Department (HOD) at Atlas Maharani Group (textile retail, Kerala, many showrooms) will present to the MD office on Monday. Your job: make sure the results are reported in a RESULT-ORIENTED way, not as routine duty, and ask clarification questions where a result is unclear or unsupported.
+var IMG = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+function b64(bytes) {
+  let s = "";
+  const CH = 32768;
+  for (let i = 0; i < bytes.length; i += CH) s += String.fromCharCode(...bytes.subarray(i, i + CH));
+  return btoa(s);
+}
+async function proofBlocks(storage, files) {
+  const blocks = [];
+  const notes = [];
+  let total = 0;
+  for (const f of (files || []).slice(0, 6)) {
+    const type = String(f.type || "").split(";")[0].toLowerCase();
+    const label = f.name || f.path.split("/").pop();
+    if (f.kind === "voice" || type.startsWith("audio/")) {
+      notes.push(`${label}: voice note (Claude cannot listen to audio)`);
+      continue;
+    }
+    const readable = IMG.includes(type) || type === "application/pdf" || type.startsWith("text/") || type === "application/csv";
+    if (!readable) {
+      notes.push(`${label}: ${type || "file"} (cannot be opened by Claude)`);
+      continue;
+    }
+    if (blocks.length >= 4) {
+      notes.push(`${label}: not read (only 4 files are read per KPI)`);
+      continue;
+    }
+    const { data, error } = await storage.from("evidence").download(f.path);
+    if (error || !data) {
+      notes.push(`${label}: could not be downloaded`);
+      continue;
+    }
+    const bytes = new Uint8Array(await data.arrayBuffer());
+    const limit = IMG.includes(type) ? 37e5 : type === "application/pdf" ? 12e6 : 2e5;
+    if (bytes.length > limit || total + bytes.length > 2e7) {
+      notes.push(`${label}: too big for Claude to read`);
+      continue;
+    }
+    total += bytes.length;
+    if (IMG.includes(type)) blocks.push({ type: "image", source: { type: "base64", media_type: type, data: b64(bytes) } });
+    else if (type === "application/pdf") blocks.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64(bytes) }, title: String(label).slice(0, 100) });
+    else blocks.push({ type: "text", text: `Attached file ${label}:
+` + new TextDecoder().decode(bytes).slice(0, 2e4) });
+    notes.push(`${label}: attached above (file ${blocks.length})`);
+  }
+  return { blocks, notes };
+}
+async function checkKpi(b) {
+  const { blocks, notes } = await proofBlocks(b.storage, b.files);
+  const prompt = `You check ONE weekly KPI result that a Head of Department (HOD) at Atlas Maharani Group (textile retail, Kerala, 24 showrooms) has just entered. It will be presented to the MD office on Monday. The MD wants RESULT-ORIENTED reporting, not "work done".
 
-How to judge each row:
-- Result-oriented: a measured outcome against the target (a number, %, or "X out of Y"), backed by verifiable supporting data (count, source report, list).
-- Activity only: says work was "done", "checked", "followed up", "ongoing", or claims 100% / Green without saying what was measured or how.
-- Every Amber or Red row needs a root cause ("reason") and a "nextStep" (what, who, by when). A vague next step ("will improve", "will follow up") is not enough \u2014 ask for the concrete action.
-- Status is calculated automatically from the achievement %, so never question the colour itself; question the figure or the evidence behind it.
-- "attached" lists voice notes / photos / files the HOD attached as evidence. You cannot open them: count them as supporting evidence that exists, do not ask for proof that is already attached, but still ask what they show if the written reason is empty.
-- Flag inconsistencies: 100% or Green with no data or evidence, figures that cannot be right for the target, headline KPIs left blank.
-- Next week's priorities should each name an expected number.
-- If the HOD already answered a question well (see earlier answers), do not ask it again.
-Never invent figures.
+KPI and the HOD's entry: ${JSON.stringify(b.kpi)}
+Department: ${str(b.deptName, 80)} (HOD: ${str(b.hod, 120)}) \xB7 Week: ${str(b.week, 40)}
+Attachments (proof): ${JSON.stringify(notes)}
+Earlier questions on this KPI and the HOD's answers: ${JSON.stringify((b.earlier || []).slice(0, 10))}
 
-LANGUAGE: Write "summary", every "issue", every "question" and every "suggestion" in simple, polite, everyday MALAYALAM (Malayalam script), the way a Kerala manager talks to a colleague. Keep KPI numbers, figures and common business terms (ATV, UPT, GP, PO, GRN, KPI, report names) in English inside the Malayalam sentence. Each question must be short enough to answer in one WhatsApp message. The "rating" value must stay exactly one of the three English labels.
+What to do:
+1. The status (Green/Amber/Red) is calculated from the achievement % and cannot be changed, so never question the colour; question the figure and the evidence.
+2. READ every attached photo / PDF / file. Find the number in it that this KPI is about (a count, a total, a %, an amount). Put that number in proof.count, and set proof.matches = true if it supports the HOD's answer (allow small rounding), false if it does not, null if the proof does not show that number. Say in proof.note, in one Malayalam sentence, what the proof shows. If nothing could be read, proof.read = false.
+3. Amber/Red needs a real root cause and a concrete next step (what, who, by when). "Will improve" / "will follow up" is not enough.
+4. Ask at most 3 short questions, only where something is unclear, unsupported, or does not match. Mark a question "high" only when the result cannot be accepted without the answer (e.g. proof contradicts the figure, Red with no real cause, 100% with no proof). If everything is clear, ask nothing.
+5. Do not repeat a question the HOD already answered well.
+verdict: "ok" = clear and supported, "doubt" = something to clarify, "weak" = activity-only / unsupported / proof contradicts.
 
-Department: ${str(b.deptName, 80)} (HOD: ${str(b.hod, 120)})
-Week: ${str(b.week, 40)} (meeting ${str(b.meeting, 40)})
-Reported rows: ${JSON.stringify((b.rows || []).slice(0, 80))}
-Headline weekly KPIs NOT reported: ${JSON.stringify(strArr(b.missing, 40))}
-Next week's priorities: ${JSON.stringify(strArr(b.priorities, 5))}
-Support needed: ${JSON.stringify(str(b.support, 1500))}
-Earlier answers from the HOD: ${JSON.stringify((b.clarifications || []).slice(0, 40))}
+LANGUAGE: "summary", "proof.note" and every question in simple, polite MALAYALAM (Malayalam script). Keep numbers and business terms (ATV, UPT, GP, PO, GRN, KPI, report names) in English inside the sentence. Each question must be answerable in one WhatsApp message.
 
 Reply with only this JSON:
-{"rating":"Result-oriented" | "Partly result-oriented" | "Activity only","score":<0-100, how result-oriented and evidence-backed the sheet is>,"summary":"<2 short sentences in Malayalam>","flags":[{"kpiNo":"<KPI number or empty>","severity":"high"|"medium"|"low","issue":"<in Malayalam, under 15 words>","question":"<one direct question in Malayalam>"}],"suggestions":["<one specific improvement in Malayalam>"]}
-At most ${maxFlags} flags, high severity first. At most 4 suggestions.`;
-  const res = await askClaudeJson(prompt, { model: Deno.env.get("CLAUDE_MODEL_CHECK") ?? "claude-sonnet-5-5", maxTokens: 4e3 });
+{"verdict":"ok"|"doubt"|"weak","summary":"<1-2 short sentences in Malayalam>","proof":{"read":true|false,"count":<number or null>,"matches":true|false|null,"note":"<Malayalam>"},"questions":[{"q":"<Malayalam question>","severity":"high"|"medium"|"low"}]}`;
+  const res = await askClaudeJson(prompt, { model: Deno.env.get("CLAUDE_MODEL_CHECK") ?? "claude-sonnet-5-5", maxTokens: 2e3 }, blocks);
   const sev = (s) => ["high", "medium", "low"].includes(String(s)) ? String(s) : "medium";
-  const score = Number(res.score);
   const order = { high: 0, medium: 1, low: 2 };
+  const pr = res.proof && typeof res.proof === "object" ? res.proof : null;
+  const cnt = pr ? Number(pr.count) : NaN;
   return {
-    rating: Object.keys(RATINGS_MAP).includes(res.rating) ? res.rating : "Partly result-oriented",
-    score: Number.isFinite(score) ? Math.max(0, Math.min(100, Math.round(score))) : null,
-    summary: str(res.summary, 800),
-    flags: (Array.isArray(res.flags) ? res.flags : []).slice(0, maxFlags).map((x) => ({ kpiNo: str(x.kpiNo, 20), severity: sev(x.severity), issue: str(x.issue, 300), question: str(x.question, 600) })).filter((x) => x.question).sort((a, b2) => order[a.severity] - order[b2.severity]),
-    suggestions: strArr(res.suggestions, 4)
+    verdict: ["ok", "doubt", "weak"].includes(res.verdict) ? res.verdict : "doubt",
+    summary: str(res.summary, 600),
+    proof: (b.files || []).length ? { read: !!(pr && pr.read), count: pr && pr.count != null && Number.isFinite(cnt) ? cnt : null, matches: pr && typeof pr.matches === "boolean" ? pr.matches : null, note: str(pr && pr.note, 400) } : null,
+    questions: (Array.isArray(res.questions) ? res.questions : []).slice(0, 3).map((x) => ({ q: str(x.q ?? x.question, 500), severity: sev(x.severity), answer: "" })).filter((x) => x.q).sort((a, c) => order[a.severity] - order[c.severity])
   };
 }
 var RATINGS_MAP = Object.fromEntries(RATINGS.map((r) => [r, true]));
@@ -128,24 +168,22 @@ var RATINGS_MAP = Object.fromEntries(RATINGS.map((r) => [r, true]));
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   try {
-    const { profile } = await getCaller(req);
+    const { profile, supabase } = await getCaller(req);
     const b = await req.json();
-    const deptId = str(b.deptId, 80);
+    const deptId = str(b.deptId, 80), week = str(b.week, 10);
     if (!(profile.role === "admin" || profile.role === "hod" && profile.dept_id === deptId)) {
       throw new HttpError(403, "Only this department's HOD or an admin can run the Claude check.");
     }
-    const rows = Array.isArray(b.rows) ? b.rows.slice(0, 80) : [];
-    if (!rows.length) throw new HttpError(400, "Enter your results first.");
-    const out = await checkSheet({
+    if (!b.kpi || typeof b.kpi !== "object") throw new HttpError(400, "Fill in the KPI first.");
+    const files = (Array.isArray(b.files) ? b.files : []).slice(0, 8).filter((f) => typeof f?.path === "string" && f.path.startsWith(`${week}/${deptId}/`));
+    const out = await checkKpi({
       deptName: str(b.deptName, 80),
       hod: str(b.hod, 120),
-      week: str(b.week, 40),
-      meeting: str(b.meeting, 40),
-      rows,
-      missing: strArr(b.missing, 40),
-      priorities: strArr(b.priorities, 5),
-      support: str(b.support, 1500),
-      clarifications: Array.isArray(b.clarifications) ? b.clarifications.slice(0, 40) : []
+      week: str(b.weekLabel, 40),
+      kpi: b.kpi,
+      earlier: Array.isArray(b.earlier) ? b.earlier.slice(0, 10) : [],
+      storage: supabase.storage,
+      files
     });
     return json(out);
   } catch (e) {

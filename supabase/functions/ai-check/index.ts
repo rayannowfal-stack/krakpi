@@ -1,23 +1,24 @@
-// Claude check of one department's weekly sheet (from the app's "Check with Claude" button).
-// Questions come back in Malayalam. Only that department's HOD or an admin may call it.
-import { cors, getCaller, HttpError, json, str, strArr } from "../_shared/claude.ts";
-import { checkSheet } from "../_shared/ai.ts";
+// Claude check of ONE KPI the HOD has just filled in (app "Check with Claude" button).
+// Claude reads the attached photos / PDFs, compares them with the figure, and asks questions in Malayalam.
+// Only that department's HOD or an admin may call it; files are read with the caller's own permissions.
+import { cors, getCaller, HttpError, json, str } from "../_shared/claude.ts";
+import { checkKpi } from "../_shared/ai.ts";
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   try {
-    const { profile } = await getCaller(req);
+    const { profile, supabase } = await getCaller(req);
     const b = await req.json();
-    const deptId = str(b.deptId, 80);
+    const deptId = str(b.deptId, 80), week = str(b.week, 10);
     if (!(profile.role === "admin" || (profile.role === "hod" && profile.dept_id === deptId))) {
       throw new HttpError(403, "Only this department's HOD or an admin can run the Claude check.");
     }
-    const rows = Array.isArray(b.rows) ? b.rows.slice(0, 80) : [];
-    if (!rows.length) throw new HttpError(400, "Enter your results first.");
-    const out = await checkSheet({
-      deptName: str(b.deptName, 80), hod: str(b.hod, 120), week: str(b.week, 40), meeting: str(b.meeting, 40),
-      rows, missing: strArr(b.missing, 40), priorities: strArr(b.priorities, 5), support: str(b.support, 1500),
-      clarifications: Array.isArray(b.clarifications) ? b.clarifications.slice(0, 40) : [],
+    if (!b.kpi || typeof b.kpi !== "object") throw new HttpError(400, "Fill in the KPI first.");
+    const files = (Array.isArray(b.files) ? b.files : []).slice(0, 8)
+      .filter((f: { path?: string }) => typeof f?.path === "string" && f.path.startsWith(`${week}/${deptId}/`));
+    const out = await checkKpi({
+      deptName: str(b.deptName, 80), hod: str(b.hod, 120), week: str(b.weekLabel, 40), kpi: b.kpi,
+      earlier: Array.isArray(b.earlier) ? b.earlier.slice(0, 10) : [], storage: supabase.storage, files,
     });
     return json(out);
   } catch (e) {

@@ -43,7 +43,7 @@ function claudeHeaders(key: string) {
 }
 
 /** Sends one prompt to Claude and returns the reply parsed as JSON. */
-export async function askClaudeJson(prompt: string, opts: { model: string; maxTokens: number }) {
+export async function askClaudeJson(prompt: string, opts: { model: string; maxTokens: number }, attachments: Record<string, unknown>[] = []) {
   const key = Deno.env.get("ANTHROPIC_API_KEY");
   if (!key) throw new HttpError(500, "Claude is not set up: add the ANTHROPIC_API_KEY secret in Supabase.");
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -52,7 +52,9 @@ export async function askClaudeJson(prompt: string, opts: { model: string; maxTo
     body: JSON.stringify({
       model: opts.model,
       max_tokens: opts.maxTokens,
-      messages: [{ role: "user", content: prompt + "\n\nReply with the JSON object only — no other text." }],
+      messages: [{ role: "user", content: attachments.length
+        ? [...attachments, { type: "text", text: prompt + "\n\nReply with the JSON object only — no other text." }]
+        : prompt + "\n\nReply with the JSON object only — no other text." }],
     }),
   });
   if (!res.ok) {

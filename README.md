@@ -1,7 +1,12 @@
-# Atlas KPI Review — version 2.2
+# Atlas KPI Review — version 3
 
 Weekly KRA & KPI review for the Atlas Maharani Group Monday HOD meeting.
 
+- **One KPI at a time.** A HOD sees the list of pending KPIs, picks one, enters the result as a **count or %** (e.g. `1420`, `92`, or `46/48`), adds the reason / proof / next step, and taps **Check with Claude**. Claude checks *that* KPI, **reads the attached photos and PDFs**, counts what the proof shows and says if it matches, and asks its questions in Malayalam. After answering, **Finish** — and the next pending KPI opens. It can be done over several days; everything saves as you go. When every KPI is finished the report is submitted automatically.
+- **Same on WhatsApp:** `START` shows the pending list, send a number to pick a KPI, then the figure, proof, reason and next step; Claude's questions follow for that KPI.
+- **MD review by Claude is in Malayalam.**
+- **Colourful PPT** with charts, a department scoreboard, KPI tiles, the HODs' **proof photos inside the slides** and links to their files. Every HOD can make **their own department's PPT** (button *My PPT*).
+- **Saturday:** morning message to each HOD with the number of KPIs still pending (HODs who are done get nothing), 1:30 PM reminder, 5 PM PPT to the admin with **HOD-wise done / not done**.
 - **HODs see only their own department** — enforced in the database, not just hidden on screen.
 - **Login with username + password.** No email anywhere — not for HODs, not for the admin. The admin creates each login. The mobile number is only for WhatsApp.
 - **WhatsApp chatbot:** on Saturday the bot asks each HOD their KPIs one by one, records every answer in the app, then asks Claude's clarification questions **in Malayalam** and records those answers too.
@@ -39,17 +44,24 @@ Weekly KRA & KPI review for the Atlas Maharani Group Monday HOD meeting.
 |---|---|
 | 9:30 AM | Bot sends every HOD the kickoff message on WhatsApp |
 | Any time | HOD replies START and answers each KPI; then Claude's Malayalam questions |
-| 1:30 PM | Reminder to HODs who haven't finished |
-| 4:30 PM | Claude writes the MD office review |
-| 5:00 PM | PowerPoint built, stored, and sent to the WhatsApp numbers in **Settings** |
+| 1:30 PM | Reminder (with pending count) to HODs who haven't finished |
+| 4:30 PM | Claude writes the MD office review (Malayalam) |
+| 5:00 PM | PowerPoint built (with proof photos), stored, and sent to the numbers in **Settings** with **HOD-wise done / not done** |
 
 ### WhatsApp commands
 
-HOD: send the figure (or % done), then for Amber/Red the reason and the next step — as text, **voice note, photo or document**. A photo/voice/document sent while a KPI is being asked is attached to that KPI.
-Commands: `START` begin/continue · `SKIP` skip a question · `BACK` previous · `STATUS` progress · `STOP` pause · `RESTART` change answers · `HELP`
+HOD: `START` → pending list → send a number to pick a KPI → send the figure (count, %, or `46/48`) → for Amber/Red the reason and next step (text, **photo, PDF or voice note**) → Claude's questions for that KPI → done, next KPI.
+Commands: `MENU` pending list · `ALL` every KPI (to change a finished one) · `SKIP` this KPI later (or an optional question) · `BACK` previous · `STATUS` progress · `STOP` pause, continue later with `START` · `HELP`
 Admin: `PPT` get this week's deck now · `STATUS` who has submitted
 
 ---
+
+## Upgrading from version 2.2 to 3 (one KPI at a time)
+
+1. Upload the new `src/`, `supabase/` and `index.html` to GitHub (replace). Vercel rebuilds by itself.
+2. SQL Editor → run all of `supabase/schema.sql` again (adds per-KPI saving, automatic score, automatic Pending points).
+3. Redeploy all 5 functions from `supabase/dashboard-paste/` (`ai-check`, `ai-review`, `admin-users`, `weekly-jobs`, `whatsapp`).
+4. WhatsApp templates changed: create them with the texts below (if you already made the old ones, make new ones with these texts; same names are fine once the old ones are deleted).
 
 ## Upgrading from version 2.1 to 2.2 (proof attachments, locked status, next step)
 
@@ -121,13 +133,17 @@ You need a Meta Business account and a phone number that is **not** already used
 5. WhatsApp → Configuration → **Webhook**: Callback URL `https://YOUR-PROJECT-REF.supabase.co/functions/v1/whatsapp`, Verify token = your `WA_VERIFY_TOKEN` → Verify and save → subscribe to **messages**.
 6. WhatsApp Manager → **Message templates** → create these two (category **Utility**, language **Malayalam**):
 
-**`kpi_weekly_start`** — Body:
-> നമസ്കാരം {{1}}, {{2}} വകുപ്പിന്റെ ഈ ആഴ്ചയിലെ KPI റിപ്പോർട്ട് ({{3}}) സമർപ്പിക്കാൻ സമയമായി. തുടങ്ങാൻ START എന്ന് മറുപടി അയക്കുക. ഇന്ന് വൈകിട്ട് 4:30-ന് മുമ്പ് പൂർത്തിയാക്കുക.
+**`kpi_weekly_start`** — Body (4 values: name, department, week, pending count):
+> നമസ്കാരം {{1}}, {{2}} വകുപ്പിന്റെ ഈ ആഴ്ചയിലെ KPI ({{3}}) — ബാക്കിയുള്ളത്: {{4}}. ഇന്ന് വൈകിട്ട് 5 മണിക്ക് മുമ്പ് പൂർത്തിയാക്കുക. തുടങ്ങാൻ START അയക്കുക.
+
+Sample values: Jayan, HR, 12 Oct – 17 Oct, 7 / 7.
 
 Add a **Quick reply** button with the text `START`.
 
-**`kpi_weekly_report`** — Header: **Document**. Body:
-> ഈ ആഴ്ചയിലെ HOD റിവ്യൂ PPT ({{1}}) തയ്യാറായി. {{2}} വകുപ്പുകൾ സമർപ്പിച്ചു. ഫയൽ ചേർത്തിരിക്കുന്നു.
+**`kpi_weekly_report`** — Header: **Document**. Body (3 values: week, HODs done, HODs not done):
+> ഈ ആഴ്ചയിലെ HOD റിവ്യൂ PPT ({{1}}) തയ്യാറായി. പൂർത്തിയാക്കിയവർ: {{2}}. പൂർത്തിയാക്കാത്തവർ: {{3}}. ഫയൽ ചേർത്തിരിക്കുന്നു.
+
+Sample values: 12 Oct – 17 Oct, Sales, HR (7 ബാക്കി).
 
 Templates must be approved by Meta (usually minutes to a day). Business-started messages are charged by Meta per message; replies within 24 hours of the HOD's last message are part of the same conversation.
 

@@ -67,6 +67,59 @@ export function summarize(rows) {
   return { score, counts: c, rag: score == null ? "none" : ragOf(score) };
 }
 export const hasValue = (r) => !!r && !!(r.actual || r.reason || r.data || r.next || r.ach != null || filesOf(r).length);
+
+/* ---------- one KPI at a time (v3) ---------- */
+/** Does this KPI's target read as a percentage? (then "46/48" or "46 of 48" counts are turned into %) */
+export const isPct = (item) => /%/.test(String(item && item.target || "")) || isManual(item);
+/** What the HOD is asked for: "pct" = a % (or X of Y), "count" = a number/count/amount. */
+export const answerKind = (item) => (isPct(item) ? "pct" : "count");
+/**
+ * Reads what the HOD typed for a KPI: "1420", "92", "92%", "46/48", "46 of 48", "Rs. 1,420".
+ * Returns { actual, ach } or null when there is no number. The status is never typed — it follows ach.
+ */
+export function resultFrom(item, input) {
+  const t = String(input ?? "").replace(/rs\.?\s*/ig, "").replace(/₹/g, "").trim();
+  if (!t) return null;
+  const of = t.match(/(\d[\d,]*(?:\.\d+)?)\s*(?:\/|of|ൽ|-ൽ|out of)\s*(\d[\d,]*(?:\.\d+)?)/i);
+  const num = (x) => parseFloat(String(x).replace(/,/g, ""));
+  if (of && isPct(item)) {
+    const a = num(of[1]), b = num(of[2]);
+    if (!(b > 0)) return null;
+    const pct = Math.round((a / b) * 1000) / 10;
+    const ach = isManual(item) ? Math.min(Math.round(pct), 120) : calcAch(item, pct);
+    return { actual: `${of[1].replace(/,/g, "")}/${of[2].replace(/,/g, "")}`, ach, pct };
+  }
+  const m = t.match(/-?\d[\d,]*(?:\.\d+)?/);
+  if (!m) return null;
+  const v = m[0].replace(/,/g, "");
+  if (isManual(item)) return { actual: v + "%", ach: Math.max(0, Math.min(Math.round(num(v)), 120)) };
+  return { actual: v, ach: calcAch(item, v) };
+}
+/** A KPI is finished when it has a result, Claude has checked this exact entry, and every required question is answered. */
+export const kpiHash = (r) => [r && r.actual || "", r && r.ach != null ? r.ach : "", r && r.reason || "", r && r.next || "", filesOf(r).map((f) => f.path).join(",")].join("|");
+export function kpiState(r) {
+  if (!r || (r.ach == null && !r.actual)) return "todo";
+  const bad = ["A", "R"].includes(statusOf(r));
+  if (bad && !((r.reason || "").trim() || filesOf(r).length)) return "need-reason";
+  if (bad && !(r.next || "").trim()) return "need-next";
+  if (!r.ai || r.ai.hash !== kpiHash(r)) return "need-check";
+  if ((r.ai.questions || []).some((q) => q.severity === "high" && !(q.answer || "").trim())) return "need-answer";
+  return r.done ? "done" : "ready";
+}
+/** The KPIs a HOD must finish this week, and where each one stands. scope "headline" = only ★ KPIs. */
+export function progressOf(dept, rows, scope = "weekly") {
+  let items = itemsFor(dept, false);
+  if (scope === "headline") items = items.filter((i) => i.star);
+  const list = items.map((i) => ({ item: i, row: (rows || {})[i.id] || null, state: kpiState((rows || {})[i.id]) }));
+  const done = list.filter((x) => x.state === "done").length;
+  return { list, done, total: list.length, pending: list.filter((x) => x.state !== "done"), complete: list.length > 0 && done === list.length };
+}
+/** What Claude reads about one KPI. */
+export function kpiCheckInput(item, row) {
+  return { no: item.no, kpi: item.text, target: item.target, frequency: FREQ[item.freq] || item.freq, headline: !!item.star,
+    answer: row.actual || "", achievement: row.ach != null ? row.ach + "%" : "", status: RAGN[statusOf(row)] || "",
+    reason: row.reason || "", nextStep: row.next || "", attached: filesSummary(row) };
+}
 /** Fingerprint of the figures, so a Claude check is redone when figures change. */
 export function rowsHash(rows) {
   return Object.keys(rows || {}).sort().map((k) => { const r = rows[k]; return [k, r.actual ?? "", r.ach ?? "", r.reason || "", r.data || "", r.next || "", filesOf(r).map((f) => f.path).join(",")].join("|"); }).join("~");
@@ -147,8 +200,11 @@ export function reviewDepartments({ depts, results, prev, actions, today }) {
     return {
       id: d.id, name: d.name, hod: d.hod, sheet: r ? r.status : "missing", via: r ? r.source : "", score: r ? summarize(r.rows).score : null, lastWeekScore: p ? summarize(p.rows).score : null,
       claudeCheck: r && r.ai ? { rating: r.ai.rating, evidenceScore: r.ai.score, summary: r.ai.summary } : null,
-      rows: r ? Object.values(r.rows || {}).map((x) => ({ no: x.no, kpi: x.text, target: x.target, actual: x.actual, ach: x.ach, status: RAGN[statusOf(x)] || "", reason: x.reason, data: x.data, nextStep: x.next || "", attached: filesSummary(x) })) : [],
-      clarifications: r ? [...(r.clar || []), ...((r.ai && r.ai.flags) || [])].map((c) => ({ kpi: c.kpiNo, q: c.question, a: c.answer || "NOT ANSWERED" })) : [],
+      rows: r ? Object.values(r.rows || {}).map((x) => ({ no: x.no, kpi: x.text, target: x.target, actual: x.actual, ach: x.ach, status: RAGN[statusOf(x)] || "", reason: x.reason || x.data || "", nextStep: x.next || "", attached: filesSummary(x),
+        claude: x.ai ? { verdict: x.ai.verdict, proof: x.ai.proof || null, note: x.ai.summary } : null, finished: !!x.done })) : [],
+      clarifications: r ? [
+        ...Object.values(r.rows || {}).flatMap((x) => ((x.ai && x.ai.questions) || []).map((q) => ({ kpi: x.no, q: q.q, a: q.answer || "NOT ANSWERED" }))),
+        ...(r.clar || []), ...((r.ai && r.ai.flags) || [])].map((c) => ({ kpi: c.kpi || c.kpiNo, q: c.q || c.question, a: c.a || c.answer || "NOT ANSWERED" })) : [],
       priorities: r ? (r.priorities || []).filter(Boolean) : [], support: r ? r.support : "",
       openActions: actions.filter((a) => a.dept === d.id && a.status !== "Done").map((a) => ({ action: a.action, owner: a.owner, due: a.due, overdue: !!(a.due && a.due < today), status: a.status })),
     };

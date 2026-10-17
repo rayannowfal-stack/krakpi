@@ -1,7 +1,7 @@
 {
   "name": "atlas-kpi-review",
   "private": true,
-  "version": "2.2.0",
+  "version": "3.0.0",
   "type": "module",
   "description": "Atlas Maharani Group - weekly KRA/KPI review: HOD results, WhatsApp bot, Claude review in Malayalam, Saturday PPT",
   "scripts": {

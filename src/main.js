@@ -5,8 +5,9 @@ import PptxGenJS from "pptxgenjs";
 import { supabase } from "./supabase.js";
 import {
   FREQ, WEEKLY, RAGN, RATINGS, RATING_ML, addDays, fmt, fmtShort, meetingWeek, weekRange, ymd,
-  calcAch, ragOf, statusOf, filesOf, filesSummary, kindOf, hasValue, isManual, summarize, rowsHash, itemsFor, buildDepts, deptListOf,
-  mapResult, mapAction, mapProposal, repeatReds, checkRows, missingHeadline, normPhone, normUsername, userLogin,
+  calcAch, ragOf, statusOf, filesOf, filesSummary, kindOf, hasValue, isManual, summarize, itemsFor, buildDepts, deptListOf,
+  answerKind, resultFrom, kpiHash, kpiState, progressOf, kpiCheckInput,
+  mapResult, mapAction, mapProposal, repeatReds, normPhone, normUsername, userLogin,
 } from "../supabase/functions/_shared/core.js";
 import { buildDeck } from "../supabase/functions/_shared/ppt-builder.js";
 
@@ -21,7 +22,7 @@ const $ = (s) => document.querySelector(s);
 const today = () => ymd(new Date());
 const nowIso = () => new Date().toISOString();
 const when = (iso) => (iso ? new Date(iso).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "");
-const TABS = { admin: ["overview", "submit", "weekly", "master", "pending", "md", "users", "settings"], viewer: ["overview", "weekly", "master", "pending", "md"], hod: ["submit", "weekly", "master", "pending"] };
+const TABS = { admin: ["overview", "submit", "weekly", "master", "pending", "md", "users", "settings"], viewer: ["overview", "submit", "master", "pending", "md"], hod: ["submit", "pending", "master"] };
 
 /* ---------- state ---------- */
 const S = {
@@ -30,7 +31,7 @@ const S = {
   week: meetingWeek(today()), tab: LS.get("tab", "overview"), dept: LS.get("dept", "sales"),
   showAll: false, weeklyDept: LS.get("wdept", "all"), masterDept: LS.get("mdept", "sales"), q: "",
   pendFilter: "open", pendDept: "all",
-  form: null, formDirty: false, aiBusy: false, mdBusy: false, jobBusy: "", channel: null,
+  kpiOpen: null, edit: null, scope: "weekly", mdBusy: false, jobBusy: "", channel: null,
 };
 const deptList = () => deptListOf(S.depts);
 const nameOf = (uid) => { const p = S.profiles.find((x) => x.id === uid); return p ? p.full_name || p.username || p.phone : uid ? "a team member" : ""; };
@@ -90,7 +91,8 @@ async function loadAdmin() {
   ]);
   S.settings = st; S.jobs = jobs || [];
 }
-async function loadAll() { await Promise.all([loadDepts(), loadProposals(), loadActions(), loadProfiles(), loadResults(), loadReview(), loadAdmin()]); }
+async function loadScope() { try { const { data } = await supabase.rpc("kpi_scope"); S.scope = data === "headline" ? "headline" : "weekly"; } catch (e) { S.scope = "weekly"; } }
+async function loadAll() { await Promise.all([loadDepts(), loadProposals(), loadActions(), loadProfiles(), loadResults(), loadReview(), loadAdmin(), loadScope()]); }
 
 function subscribe() {
   if (S.channel) supabase.removeChannel(S.channel);
@@ -101,9 +103,8 @@ function subscribe() {
     t = setTimeout(async () => {
       const fns = [...new Set([...pending].map((x) => loaders[x]).filter(Boolean))]; pending.clear();
       await Promise.all(fns.map((f) => f()));
-      if (S.tab === "submit" && S.formDirty) return;
-      if (S.tab === "submit") S.form = null;
-      if (!S.aiBusy && !S.mdBusy && !document.querySelector(".overlay")) render();
+      if (S.tab === "submit" && S.kpiOpen) return; // don't disturb someone filling a KPI
+      if (!S.mdBusy && !document.querySelector(".overlay")) render();
     }, 400);
   }).subscribe();
 }
@@ -187,19 +188,21 @@ function renderHeader() {
   $("#wkRange").textContent = "Covers " + weekRange(S.week);
   const allowed = TABS[role()] || [];
   document.querySelectorAll("#tabs button").forEach((b) => { b.hidden = !allowed.includes(b.dataset.tab); b.setAttribute("aria-current", b.dataset.tab === S.tab ? "page" : "false"); });
-  $("#pptBtn").hidden = !["admin", "viewer"].includes(role());
+  const sb = document.querySelector('#tabs button[data-tab="submit"]'); if (sb) sb.textContent = role() === "hod" ? "My KPIs" : "Results";
+  $("#pptBtn").hidden = !["admin", "viewer", "hod"].includes(role());
+  $("#pptBtn").textContent = role() === "hod" ? "My PPT" : "Make PPT";
   const deptName = S.me && S.me.dept_id && S.depts[S.me.dept_id] ? " · " + S.depts[S.me.dept_id].name : "";
   $("#roleChip").textContent = (ROLES[role()] || "") + (role() === "hod" ? deptName : "");
 }
 $("#wkPrev").onclick = () => setWeek(addDays(S.week, -7));
 $("#wkNext").onclick = () => setWeek(addDays(S.week, 7));
 $("#tabs").addEventListener("click", (e) => { const b = e.target.closest("button[data-tab]"); if (!b) return; S.tab = b.dataset.tab; LS.set("tab", S.tab); render(); });
-$("#pptBtn").onclick = () => makePpt();
+$("#pptBtn").onclick = () => makePpt(role() === "hod" ? S.me.dept_id : null);
 $("#signOut").onclick = () => supabase.auth.signOut();
 $("#myPw").onclick = () => passwordModal();
 
 async function setWeek(w) {
-  S.week = w; S.form = null; S.formDirty = false; S.results = {}; S.prev = {}; S.review = null; render();
+  S.week = w; S.kpiOpen = null; S.edit = null; S.results = {}; S.prev = {}; S.review = null; render();
   await Promise.all([loadResults(), loadReview()]); render();
 }
 
@@ -232,22 +235,33 @@ function labelTables(root) {
 }
 const viaBadge = (r) => (r && r.source === "whatsapp" ? ` <span class="pill wa">via WhatsApp</span>` : "");
 
+/* Claude's per-KPI findings for one department, in one line */
+function claudeTally(r) {
+  const t = { ok: 0, doubt: 0, weak: 0, mismatch: 0, open: 0 };
+  Object.values((r && r.rows) || {}).forEach((x) => { if (!x.ai) return; t[x.ai.verdict] = (t[x.ai.verdict] || 0) + 1; if (x.ai.proof && x.ai.proof.matches === false) t.mismatch++; t.open += (x.ai.questions || []).filter((q) => !(q.answer || "").trim()).length; });
+  return t;
+}
+function claudeLine(r) {
+  const t = claudeTally(r); if (!t.ok && !t.doubt && !t.weak) return "";
+  return `<div class="meta">Claude: <span class="pill G">${t.ok} clear</span> <span class="pill A">${t.doubt} doubt</span> <span class="pill R">${t.weak} weak</span>${t.mismatch ? ` <span class="pill R">📎 ${t.mismatch} proof ≠ figure</span>` : ""}</div>`;
+}
 /* Overview */
 function vOverview() {
   const ds = deptList();
   let sub = 0; const all = { G: 0, A: 0, R: 0 }; const scores = [];
   const cards = ds.map((d) => {
-    const r = S.results[d.id]; const submitted = r && r.status === "submitted";
+    const r = S.results[d.id]; const pg = progress(d.id); const submitted = pg.complete || (r && r.status === "submitted");
     const sm = r ? summarize(r.rows) : { score: null, counts: { G: 0, A: 0, R: 0 }, rag: "none" };
     if (submitted) { sub++; for (const k in all) all[k] += sm.counts[k]; if (sm.score != null) scores.push(sm.score); }
     const pv = S.prev[d.id] ? summarize(S.prev[d.id].rows).score : null;
     const trend = sm.score != null && pv != null ? (sm.score > pv ? "↑" : sm.score < pv ? "↓" : "→") + ` from ${pv}%` : "";
     const open = S.actions.filter((a) => a.dept === d.id && a.status !== "Done").length;
     return `<button class="dcard ${submitted ? sm.rag : "none"}" data-act="goto-submit" data-dept="${d.id}">
-      <div class="top"><h3>${esc(d.name)}</h3>${submitted ? `<span class="pill ${sm.rag}">${RAGN[sm.rag] || "—"}</span>` : r ? `<span class="pill none">Draft</span>` : `<span class="pill none">Not submitted</span>`}</div>
+      <div class="top"><h3>${esc(d.name)}</h3>${submitted ? `<span class="pill G">Done ✓</span>` : `<span class="pill ${pg.done ? "A" : "R"}">${pg.done}/${pg.total} done</span>`}</div>
+      <div class="prog sm"><div class="bar"><i style="width:${pg.total ? Math.round((pg.done / pg.total) * 100) : 0}%"></i></div></div>
       <div class="top"><span class="score">${sm.score != null ? sm.score + "%" : "—"}</span><span class="meta">${esc(trend)}</span></div>
       <div class="rag-row"><span class="pill G">${sm.counts.G} G</span><span class="pill A">${sm.counts.A} A</span><span class="pill R">${sm.counts.R} R</span><span class="pill none">${open} open actions</span>${viaBadge(r)}</div>
-      ${r && r.ai ? `<div class="meta">Claude: <span class="pill ${RATINGS[r.ai.rating] || "none"}">${esc(r.ai.rating)}</span>${r.ai.score != null ? ` · evidence ${esc(r.ai.score)}/100` : ""}</div>` : ""}
+      ${claudeLine(r)}
       <div class="meta">HOD: ${esc(d.hod || "—")}${r && r.at ? ` · ${r.status === "submitted" ? "Submitted" : "Saved"} ${esc(when(r.at))}` : ""}</div>
     </button>`;
   }).join("");
@@ -257,7 +271,7 @@ function vOverview() {
     <div class="head-row"><div><h2>Week ${esc(weekRange(S.week))}</h2><p class="sub">Monday HOD meeting on ${esc(fmt(S.week))}. Reports close Saturday; the PPT goes to WhatsApp at 5 PM.</p></div>
     <button class="btn primary" data-act="ppt">Make PPT for this week</button></div>
     <div class="stats">
-      <div class="stat"><b>${sub}/${ds.length}</b><span>Submitted</span></div>
+      <div class="stat"><b>${sub}/${ds.length}</b><span>HODs done</span></div>
       <div class="stat"><b>${grp != null ? grp + "%" : "—"}</b><span>Group score</span></div>
       <div class="stat"><b style="color:var(--g)">${all.G}</b><span>Green KPIs</span></div>
       <div class="stat"><b style="color:var(--a)">${all.A}</b><span>Amber KPIs</span></div>
@@ -268,82 +282,203 @@ function vOverview() {
   <p class="note">Green ≥ 95% · Amber 80–94% · Red below 80% of target. Tap a department to open its result sheet.</p>`;
 }
 
-/* Submit */
-function ensureForm() {
-  const key = S.week + "__" + S.dept;
-  if (S.form && S.form.key === key) return S.form;
-  const r = S.results[S.dept];
-  S.form = {
-    key, rows: JSON.parse(JSON.stringify((r && r.rows) || {})), priorities: r && r.priorities ? r.priorities.slice() : ["", "", ""], support: (r && r.support) || "", newActions: [],
-    ai: r && r.ai ? JSON.parse(JSON.stringify(r.ai)) : null, clar: r && r.clar ? r.clar.slice() : [],
-  };
-  while (S.form.priorities.length < 3) S.form.priorities.push("");
-  S.formDirty = false;
-  return S.form;
-}
+/* ---------- My KPIs: one KPI at a time (pending list → fill one → Claude checks it → answer → done) ---------- */
+const STATE_TXT = {
+  todo: ["To fill", "പൂരിപ്പിക്കാനുണ്ട്", "none"], "need-reason": ["Add reason", "കാരണം വേണം", "R"], "need-next": ["Add next step", "അടുത്ത നടപടി വേണം", "R"],
+  "need-check": ["Check with Claude", "Claude പരിശോധന", "A"], "need-answer": ["Answer Claude", "Claude-ന് മറുപടി", "A"], ready: ["Ready — tap Finish", "പൂർത്തിയാക്കാം", "G"], done: ["Done", "പൂർത്തിയായി", "G"],
+};
+const VERDICT = { ok: ["Clear", "G"], doubt: ["Needs clarity", "A"], weak: ["Weak / not proved", "R"], skipped: ["Not checked", "none"] };
+const scopeNow = () => S.scope || "weekly";
+const progress = (deptId) => progressOf(S.depts[deptId], (S.results[deptId] || {}).rows || {}, scopeNow());
+const resultText = (item, row) => !row || (row.ach == null && !row.actual) ? "—" : `${row.actual ? esc(row.actual) : ""}${row.ach != null ? ` <b>→ ${row.ach}%</b>` : ""}`;
+
 function vSubmit() {
-  const ds = deptList(); const d = S.depts[S.dept]; const f = ensureForm(); const r = S.results[S.dept];
-  const editable = mayEditDept(S.dept);
-  const all = S.showAll || Object.keys(f.rows).some((id) => !WEEKLY.has(((d.items || []).find((i) => i.id === id) || {}).freq) && hasValue(f.rows[id]));
-  const items = itemsFor(d, all);
-  const dis = editable ? "" : "disabled";
-  const rowsHtml = items.map((i) => {
-    const row = f.rows[i.id] || {};
-    const ach = typeof row.ach === "number" ? row.ach : null; const rag = statusOf(row);
-    const manual = isManual(i);
-    return `<tr data-id="${esc(i.id)}">
-      <td class="kpi" data-label=""><span class="no">${i.star ? '<span class="star" title="Headline KPI">★</span> ' : ""}${esc(i.no)}</span> ${esc(i.text)}<div class="who">${esc(i.owner)} · target ${esc(i.target)} <span class="freq">${esc(i.freq)}</span></div></td>
-      <td>${manual ? `<span class="note">no number</span>` : `<input class="inp num" data-f="actual" inputmode="decimal" aria-label="Actual for ${esc(i.no)}" value="${esc(row.actual ?? "")}" placeholder="actual" ${dis}>`}</td>
-      <td>${manual ? `<input class="inp num" data-f="ach" inputmode="decimal" aria-label="Percent done for ${esc(i.no)}" value="${esc(ach ?? "")}" placeholder="% done" ${dis}>` : `<span class="ach" data-out="ach">${ach != null ? ach + "%" : "—"}</span>`}</td>
-      <td><span class="pill ${rag || "none"} locked" data-out="rag" title="Set automatically from Ach % (95%+ Green, 80–94% Amber, below 80% Red). It can't be changed by hand.">🔒 ${rag ? RAGN[rag] : "—"}</span></td>
-      <td><textarea class="inp" data-f="reason" rows="1" aria-label="Reason for ${esc(i.no)}" placeholder="${rag === "A" || rag === "R" ? "Reason (needed for Amber/Red)" : "Reason / remarks"}" ${dis}>${esc(row.reason || "")}</textarea>
-        <div class="files" data-files="${esc(i.id)}">${filesHtml(i.id, row, editable)}</div></td>
-      <td><textarea class="inp" data-f="next" rows="1" aria-label="Next step for ${esc(i.no)}" placeholder="${rag === "A" || rag === "R" ? "What, who, by when" : "Next step"}" ${dis}>${esc(row.next || "")}</textarea></td>
-      <td><textarea class="inp" data-f="data" rows="1" aria-label="Supporting data for ${esc(i.no)}" placeholder="e.g. 46 of 50 indents" ${dis}>${esc(row.data || "")}</textarea></td>
-    </tr>`;
-  }).join("");
-  const open = S.actions.filter((a) => a.dept === S.dept && a.status !== "Done");
-  const actHtml = open.length ? `<div class="tbl-wrap"><table class="resp"><thead><tr><th>Action</th><th>Owner</th><th>Due</th><th>Status</th><th>Result</th></tr></thead><tbody>
-    ${open.map((a) => `<tr><td class="kpi">${esc(a.action)}<div class="who">${esc(a.kpiNo ? "KPI " + a.kpiNo : "")}</div></td><td>${esc(a.owner)}</td>
-      <td class="${a.due && a.due < today() ? "overdue" : ""}">${a.due ? esc(fmtShort(a.due)) : "—"}</td>
-      <td><select class="inp" data-act-status="${esc(a._id)}" ${dis}>${["Open", "In progress", "Done", "Not done"].map((s) => `<option ${a.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></td>
-      <td><input class="inp" data-act-result="${esc(a._id)}" value="${esc(a.result || "")}" placeholder="Result shown" ${dis}></td></tr>`).join("")}
-    </tbody></table></div>` : `<p class="note">No open actions for ${esc(d.name)}.</p>`;
-  const kpiOpts = itemsFor(d, true).map((i) => `<option value="${esc(i.id)}">${esc(i.no)} · ${esc(i.text.slice(0, 60))}</option>`).join("");
-  const naHtml = f.newActions.map((a, ix) => `<tr><td>${esc(a.kpiNo)}</td><td class="kpi">${esc(a.action)}</td><td>${esc(a.owner)}</td><td>${a.due ? esc(fmtShort(a.due)) : "—"}</td><td><button class="btn small ghost danger" data-act="rm-new" data-ix="${ix}">Remove</button></td></tr>`).join("");
-  const chips = hodLocked() || ds.length < 2 ? "" : `<div class="chips" role="group" aria-label="Department">${ds.map((x) => `<button class="chip" data-act="set-dept" data-dept="${x.id}" aria-pressed="${x.id === S.dept}">${esc(x.name)}</button>`).join("")}</div>`;
+  if (S.kpiOpen && S.depts[S.dept] && (S.depts[S.dept].items || []).some((i) => i.id === S.kpiOpen)) return vKpi();
+  S.kpiOpen = null;
+  const ds = deptList(); const d = S.depts[S.dept]; const r = S.results[S.dept];
+  const pg = progress(S.dept); const pct = pg.total ? Math.round((pg.done / pg.total) * 100) : 0;
+  const editable = mayEditDept(S.dept); const hod = role() === "hod";
+  const chips = hodLocked() || ds.length < 2 ? "" : `<div class="chips" role="group" aria-label="Department">${ds.map((x) => { const q = progress(x.id); return `<button class="chip" data-act="set-dept" data-dept="${x.id}" aria-pressed="${x.id === S.dept}">${esc(x.name)} <small>${q.done}/${q.total}</small></button>`; }).join("")}</div>`;
+  const card = (x, i) => {
+    const st = STATE_TXT[x.state] || STATE_TXT.todo; const rag = statusOf(x.row);
+    return `<button class="kcard ${x.state === "done" ? "done" : ""}" data-act="open-kpi" data-id="${esc(x.item.id)}">
+      <span class="kn">${x.state === "done" ? "✓" : i + 1}</span>
+      <span class="kt"><b>${x.item.star ? '<span class="star">★</span> ' : ""}${esc(x.item.text)}</b>
+        <small>KPI ${esc(x.item.no)} · target ${esc(x.item.target)}</small>
+        ${x.row && (x.row.ach != null || x.row.actual) ? `<small>${resultText(x.item, x.row)} ${rag ? `<span class="pill ${rag}">🔒 ${RAGN[rag]}</span>` : ""}${filesOf(x.row).length ? ` <span class="pill none">📎 ${filesOf(x.row).length}</span>` : ""}${x.row.ai ? ` <span class="pill ${(VERDICT[x.row.ai.verdict] || VERDICT.doubt)[1]}">Claude: ${(VERDICT[x.row.ai.verdict] || VERDICT.doubt)[0]}</span>` : ""}</small>` : ""}</span>
+      <span class="ks"><span class="pill ${st[2]}">${st[0]}</span><small class="ml">${st[1]}</small></span>
+    </button>`;
+  };
+  const extra = itemsFor(d, true).filter((i) => !pg.list.some((x) => x.item.id === i.id));
   return `<section class="panel">
-    <div class="head-row"><div><h2>${role() === "hod" ? "My KPI results" : "Submit results"}</h2><p class="sub">${esc(d.name)} · week ${esc(weekRange(S.week))} · HOD ${esc(d.hod || "")}</p></div>${chips}</div>
-    ${!editable ? `<div class="banner">You can view this sheet. Only ${esc(d.name)}'s HOD or an admin can change it.</div>` : ""}
-    ${r ? `<div class="banner ${r.status === "submitted" ? "ok" : ""}">${r.status === "submitted" ? "Submitted" : "Draft saved"}${r.source === "whatsapp" ? " on WhatsApp" : ""} by ${esc(nameOf(r.by))} on ${esc(new Date(r.at).toLocaleString("en-IN"))}.${editable ? " You can still correct it before Saturday 5 PM." : ""}</div>` : ""}
-    ${role() === "hod" ? `<p class="note">You can also send your KPIs on WhatsApp: message <b>START</b> to the company KPI number.</p>` : ""}
-    <div class="toolbar"><span class="note grow">Enter the week's actual figure (or % done where a KPI has no number). Achievement % and 🔒 status are set automatically and can't be changed. For Amber/Red give the reason and the next step, and attach a voice note, photo or file as proof. ★ = headline KPI.</span>
-      <label class="note"><input type="checkbox" id="showAll" ${S.showAll ? "checked" : ""}> Show monthly &amp; other KPIs</label></div>
-    <div class="tbl-wrap"><table id="resTbl" class="resp sheet"><thead><tr><th data-label="">KPI</th><th>Actual</th><th>Ach %</th><th>Status</th><th>Reason &amp; proof</th><th>Next step</th><th>Supporting data</th></tr></thead><tbody>${rowsHtml || `<tr><td colspan="7" class="note">No weekly KPIs. Tick “Show monthly &amp; other KPIs”.</td></tr>`}</tbody></table></div>
+    <div class="head-row"><div><h2>${hod ? "My KPIs" : "Results"} · ${esc(d.name)}</h2><p class="sub">Week ${esc(weekRange(S.week))} · finish by <b>Saturday 5 PM</b></p></div>${chips}</div>
+    <div class="prog"><div class="bar"><i style="width:${pct}%"></i></div><b>${pg.done} of ${pg.total} done</b>${pg.complete ? `<span class="pill G">All done ✓ submitted</span>` : ""}</div>
+    ${editable ? `<p class="note">Tap a KPI → enter the figure (count or %) → add proof → <b>Check with Claude</b> → answer → <b>Finish</b>. You can do one now and the rest later. <span class="ml">ഒരു KPI തിരഞ്ഞെടുക്കുക, പൂരിപ്പിക്കുക, Claude പരിശോധിക്കും.</span></p>` : ""}
+    ${role() === "hod" ? `<p class="note">On WhatsApp: send <b>START</b> to the company KPI number.</p>` : ""}
   </section>
-  <section class="two">
-    <div class="panel"><h3>Last week's actions</h3><p class="note">Update each open action. Changes save straight away.</p>${actHtml}</div>
-    <div class="panel"><h3>This week's plan</h3>
-      ${[0, 1, 2].map((i) => `<label class="f">Priority ${i + 1}<input class="inp" data-pri="${i}" value="${esc(f.priorities[i] || "")}" placeholder="What, and the number you expect" ${dis}></label>`).join("")}
-      <label class="f">Support needed from CEO / other departments<textarea class="inp" id="support" rows="2" ${dis}>${esc(f.support)}</textarea></label>
-    </div>
-  </section>
-  ${editable ? `<section class="panel">
-    <div class="head-row"><div><h3>New actions for Red KPIs</h3><p class="sub">Added to Pending points when you submit.</p></div></div>
-    ${naHtml ? `<div class="tbl-wrap"><table class="resp"><thead><tr><th>KPI</th><th>Action</th><th>Owner</th><th>Due</th><th></th></tr></thead><tbody>${naHtml}</tbody></table></div>` : ""}
-    <div class="form-grid">
-      <label class="f">KPI<select class="inp" id="naKpi"><option value="">General</option>${kpiOpts}</select></label>
-      <label class="f wide">Action<input class="inp" id="naText" placeholder="What will be done"></label>
-      <label class="f">Owner<input class="inp" id="naOwner"></label>
-      <label class="f">Due date<input class="inp" type="date" id="naDue"></label>
-    </div>
-    <div><button class="btn" data-act="add-new">Add action</button></div>
-  </section>` : ""}
-  ${aiPanel(editable)}
-  ${editable ? `<div class="toolbar savebar"><span class="grow note" id="dirtyNote">${S.formDirty ? "Unsaved changes" : ""}</span>
-    <button class="btn" data-act="save-draft">Save draft</button>
-    <button class="btn primary" data-act="submit">Submit results</button></div>` : ""}`;
+  ${pg.pending.length ? `<section class="panel"><h3>Pending (${pg.pending.length}) <span class="ml note">ബാക്കി</span></h3><div class="klist">${pg.pending.map(card).join("")}</div></section>` : ""}
+  ${pg.done ? `<section class="panel"><h3>Done (${pg.done})</h3><div class="klist">${pg.list.filter((x) => x.state === "done").map(card).join("")}</div></section>` : ""}
+  ${extra.length ? `<details class="panel"><summary><b>Monthly &amp; other KPIs (${extra.length})</b> <span class="note">— optional this week</span></summary><div class="klist" style="margin-top:10px">${extra.map((i, ix) => card({ item: i, row: (r && r.rows[i.id]) || null, state: kpiState(r && r.rows[i.id]) }, ix)).join("")}</div></details>` : ""}
+  ${planPanel(editable)}`;
 }
+function planPanel(editable) {
+  const r = S.results[S.dept] || {}; const pr = (r.priorities || []).slice(); while (pr.length < 3) pr.push("");
+  const dis = editable ? "" : "disabled";
+  return `<details class="panel" ${pr.some(Boolean) ? "" : ""}><summary><b>Next week's plan</b> <span class="note">— optional</span></summary>
+    <div class="form-grid" style="margin-top:10px">${pr.slice(0, 3).map((x, i) => `<label class="f wide">Priority ${i + 1}<input class="inp" id="pri${i}" value="${esc(x)}" placeholder="What, and the number you expect" ${dis}></label>`).join("")}
+    <label class="f wide">Support needed from CEO / other departments<textarea class="inp" id="support" rows="2" ${dis}>${esc(r.support || "")}</textarea></label></div>
+    ${editable ? `<div><button class="btn" data-act="save-plan">Save plan</button></div>` : ""}</details>`;
+}
+async function savePlan() {
+  const priorities = [0, 1, 2].map((i) => $("#pri" + i).value.trim()); const support = $("#support").value.trim();
+  const ex = S.results[S.dept];
+  const q = ex ? supabase.from("results").update({ priorities, support, updated_at: nowIso() }).eq("week", S.week).eq("dept_id", S.dept)
+    : supabase.from("results").insert({ week: S.week, dept_id: S.dept, status: "draft", rows: {}, priorities, support, source: "app" });
+  if (await run(q, "Plan saved")) { await loadResults(); render(); }
+}
+
+/* one KPI */
+function openKpi(id) {
+  const r = S.results[S.dept]; const row = JSON.parse(JSON.stringify((r && r.rows[id]) || {}));
+  S.kpiOpen = id; S.edit = { id, row, input: row.actual || (row.ach != null && !row.actual ? String(row.ach) : ""), busy: false, dirty: false };
+  render(); window.scrollTo(0, 0);
+}
+function closeKpi() { S.kpiOpen = null; S.edit = null; render(); window.scrollTo(0, 0); }
+function vKpi() {
+  const d = S.depts[S.dept]; const item = d.items.find((i) => i.id === S.kpiOpen);
+  if (!S.edit || S.edit.id !== item.id) { openKpi(item.id); return ""; }
+  const e = S.edit; const row = e.row; const editable = mayEditDept(S.dept); const dis = editable ? "" : "disabled";
+  const rag = statusOf(row); const bad = rag === "A" || rag === "R"; const kind = answerKind(item); const state = kpiState(row);
+  const pg = progress(S.dept); const pos = pg.list.findIndex((x) => x.item.id === item.id);
+  const ai = row.ai; const stale = ai && ai.hash !== kpiHash(row);
+  return `<section class="panel kpi-one">
+    <div class="toolbar"><button class="btn" data-act="close-kpi">← All KPIs</button><span class="note grow">${pos >= 0 ? `KPI ${pos + 1} of ${pg.total}` : "Optional KPI"}</span>${row.done && !stale ? `<span class="pill G">Done ✓</span>` : ""}</div>
+    <div><h2>${item.star ? '<span class="star">★</span> ' : ""}${esc(item.text)}</h2>
+      <p class="sub">KPI ${esc(item.no)} · ${esc(item.owner)} · <span class="freq">${esc(FREQ[item.freq] || item.freq)}</span></p></div>
+    <div class="target"><span>Target</span><b>${esc(item.target)}</b></div>
+
+    <div class="step"><span class="sn">1</span><div class="grow">
+      <label class="f big">${kind === "pct" ? (isManual(item) ? "How much is done? (%)" : "Result this week (%)") : "Result this week (number)"}
+        <input class="inp big" id="kAns" inputmode="${kind === "pct" ? "text" : "decimal"}" autocomplete="off" value="${esc(e.input)}" placeholder="${kind === "pct" ? "e.g. 92  or  46/48" : "e.g. 1420"}" ${dis}></label>
+      <p class="note">${kind === "pct" ? "Type the % — or the count, like <b>46/48</b> (46 out of 48), and the % is worked out." : "Type the count or amount for the week."} <span class="ml">${kind === "pct" ? "ശതമാനം അല്ലെങ്കിൽ എണ്ണം (46/48)" : "എണ്ണം / തുക"}</span></p>
+      <div class="live" id="kLive">${liveHtml(row)}</div>
+    </div></div>
+
+    <div class="step"><span class="sn">2</span><div class="grow">
+      <label class="f">Reason / remarks <span id="reqReason">${reqTag(bad, rag)}</span>
+        <textarea class="inp" id="kReason" rows="2" placeholder="${bad ? "Why is it below target?" : "Anything to explain, e.g. where the number comes from"}" ${dis}>${esc(row.reason || row.data || "")}</textarea></label>
+      <div class="f"><span>Proof — photo, PDF, file or voice <span class="note">(Claude reads photos &amp; PDFs)</span></span>
+        <div class="files" data-files="${esc(item.id)}">${filesHtml(item.id, row, editable)}</div></div>
+    </div></div>
+
+    <div class="step"><span class="sn">3</span><div class="grow">
+      <label class="f">Next step <span id="reqNext">${reqTag(bad, rag, true)}</span>
+        <textarea class="inp" id="kNext" rows="2" placeholder="What will be done, who, by when" ${dis}>${esc(row.next || "")}</textarea></label>
+    </div></div>
+
+    <div class="step ai"><span class="sn">4</span><div class="grow" id="kAi">${kpiAiHtml(item, row, editable)}</div></div>
+  </section>
+  ${editable ? `<div class="toolbar savebar"><span class="grow note" id="dirtyNote">${e.dirty ? "Unsaved changes" : ""}</span>
+    <button class="btn" data-act="save-kpi" ${e.busy ? "disabled" : ""}>Save</button>
+    <button class="btn primary" data-act="finish-kpi" id="kFinish" ${state === "ready" || state === "done" ? "" : "disabled"}>Finish ✓</button></div>` : ""}`;
+}
+const reqTag = (bad, rag, next) => (bad ? `<span class="req">needed${next ? "" : " for " + RAGN[rag]}</span>` : `<span class="note">(optional)</span>`);
+function liveHtml(row) {
+  const rag = statusOf(row);
+  if (row.ach == null) return `<span class="note">Achievement and status appear here.</span>`;
+  return `<span class="ach">${row.ach}% of target</span> <span class="pill ${rag || "none"} locked" title="Set automatically: 95%+ Green, 80–94% Amber, below 80% Red">🔒 ${RAGN[rag] || "—"}</span>`;
+}
+function kpiAiHtml(item, row, editable) {
+  const ai = row.ai; const busy = S.edit && S.edit.busy; const stale = ai && ai.hash !== kpiHash(row);
+  const can = row.ach != null || row.actual;
+  const btn = editable ? `<button class="btn primary wide" data-act="kpi-check" ${busy || !can ? "disabled" : ""}>${busy ? "Claude is checking…" : ai ? "Check again with Claude" : "Check with Claude"}</button>` : "";
+  if (busy) return `<b>Claude check</b><div class="thinking">Claude is reading your figure${filesOf(row).length ? " and the proof" : ""}… <span class="ml">പരിശോധിക്കുന്നു</span></div>`;
+  if (!ai) return `<b>Claude check</b><p class="note">${can ? "Claude will check the figure and read your proof, then ask if anything is unclear." : "Enter the result first."}</p>${btn}`;
+  const v = VERDICT[ai.verdict] || VERDICT.doubt; const pr = ai.proof;
+  return `<div class="toolbar"><b>Claude check</b><span class="pill ${v[1]}">${v[0]}</span><span class="note">${esc(when(ai.at))}</span></div>
+    ${stale ? `<div class="banner">You changed this KPI after the check — check again.</div>` : ""}
+    <p class="ml" style="margin:0">${esc(ai.summary || "")}</p>
+    ${pr ? `<div class="proofread ${pr.matches === true ? "G" : pr.matches === false ? "R" : "none"}"><b>📎 Proof:</b> ${pr.read ? (pr.count != null ? `Claude counted <b>${esc(pr.count)}</b> ${pr.matches === true ? "— matches ✓" : pr.matches === false ? "— does NOT match ✗" : ""}` : "read") : "could not be read"}<div class="ml">${esc(pr.note || "")}</div></div>` : ""}
+    ${(ai.questions || []).length ? `<div class="flags">${ai.questions.map((q, ix) => `<div class="flag ${esc(q.severity)}"><div class="q ml">${esc(q.q)}</div>
+      <textarea class="inp" data-kq="${ix}" rows="2" placeholder="${q.severity === "high" ? "മറുപടി നിർബന്ധം · answer required" : "നിങ്ങളുടെ മറുപടി (optional)"}" ${editable ? "" : "disabled"}>${esc(q.answer || "")}</textarea></div>`).join("")}</div>` : `<p class="note">No questions — Claude found it clear.</p>`}
+    ${stale ? btn : ""}`;
+}
+function readKpiForm() {
+  const e = S.edit; if (!e) return;
+  const item = S.depts[S.dept].items.find((i) => i.id === e.id);
+  const ans = $("#kAns"); if (ans) {
+    e.input = ans.value;
+    const r = resultFrom(item, ans.value);
+    e.row.actual = r ? r.actual : ""; e.row.ach = r ? r.ach : null;
+  }
+  const rs = $("#kReason"); if (rs) { e.row.reason = rs.value; delete e.row.data; }
+  const nx = $("#kNext"); if (nx) e.row.next = nx.value;
+  document.querySelectorAll("[data-kq]").forEach((t) => { const q = e.row.ai && e.row.ai.questions[+t.dataset.kq]; if (q) q.answer = t.value; });
+  delete e.row.rag;
+}
+function refreshKpiBits() {
+  const e = S.edit; if (!e) return;
+  const live = $("#kLive"); if (live) live.innerHTML = liveHtml(e.row);
+  const st = kpiState(e.row); const f = $("#kFinish"); if (f) f.disabled = !(st === "ready" || st === "done");
+  const rag = statusOf(e.row); const bad = rag === "A" || rag === "R";
+  const rr = $("#reqReason"); if (rr) rr.innerHTML = reqTag(bad, rag);
+  const rn = $("#reqNext"); if (rn) rn.innerHTML = reqTag(bad, rag, true);
+  if (!e.row.ai && !e.busy) { const box = $("#kAi"); const item = S.depts[S.dept].items.find((i) => i.id === e.id); if (box && item) box.innerHTML = kpiAiHtml(item, e.row, mayEditDept(S.dept)); }
+  const ck = document.querySelector('[data-act="kpi-check"]'); if (ck && !e.busy) ck.disabled = !(e.row.ach != null || e.row.actual);
+  const n = $("#dirtyNote"); if (n) n.textContent = e.dirty ? "Unsaved changes" : "";
+}
+function bindSubmit() {
+  if (!S.kpiOpen) return;
+  const onEdit = () => { readKpiForm(); S.edit.dirty = true; refreshKpiBits(); };
+  ["#kAns", "#kReason", "#kNext"].forEach((sel) => { const el = $(sel); el && el.addEventListener("input", onEdit); });
+  document.querySelectorAll("[data-kq]").forEach((t) => t.addEventListener("input", onEdit));
+}
+/** Saves the open KPI (merged into the week's sheet in the database; other KPIs untouched). */
+async function saveKpi(opts = {}) {
+  const e = S.edit; if (!e) return false; readKpiForm();
+  const d = S.depts[S.dept]; const item = d.items.find((i) => i.id === e.id);
+  const row = { ...e.row, no: item.no, text: item.text, target: item.target, star: !!item.star, kraNo: item.kraNo, freq: item.freq, files: filesOf(e.row), updated_at: nowIso() };
+  if (!opts.done && kpiState(row) !== "done") row.done = false;
+  if (opts.done) row.done = true;
+  const rows = { ...((S.results[S.dept] || {}).rows || {}), [e.id]: row };
+  const complete = progressOf(d, rows, scopeNow()).complete;
+  const { error } = await supabase.rpc("save_kpi", { p_week: S.week, p_dept: S.dept, p_kpi: e.id, p_row: row, p_source: "app", p_complete: complete });
+  if (error) { toast("Couldn't save: " + error.message); return false; }
+  e.row = row; e.dirty = false;
+  await Promise.all([loadResults(), opts.done ? loadActions() : null]);
+  if (!opts.quiet) toast(opts.done ? (complete ? "All KPIs done — submitted ✓" : "KPI done ✓") : "Saved");
+  return true;
+}
+async function kpiCheck() {
+  const e = S.edit; readKpiForm();
+  const d = S.depts[S.dept]; const item = d.items.find((i) => i.id === e.id);
+  if (e.row.ach == null && !e.row.actual) return toast("Enter the result first.");
+  const earlier = [...(e.row.qa || []), ...((e.row.ai && e.row.ai.questions) || []).filter((q) => (q.answer || "").trim()).map((q) => ({ q: q.q, a: q.answer }))];
+  e.busy = true; const box = $("#kAi"); if (box) box.innerHTML = kpiAiHtml(item, e.row, true);
+  try {
+    const res = await callFn("ai-check", { deptId: S.dept, week: S.week, weekLabel: weekRange(S.week), deptName: d.name, hod: d.hod,
+      kpi: kpiCheckInput(item, e.row), earlier, files: filesOf(e.row).map((f) => ({ path: f.path, name: f.name, type: f.type, kind: f.kind })) });
+    e.row.qa = earlier.slice(-10);
+    e.row.ai = { ...res, at: nowIso(), hash: kpiHash(e.row), questions: (res.questions || []).map((q) => ({ ...q, answer: "" })) };
+    e.busy = false;
+    await saveKpi({ quiet: true });
+    render();
+    const st = kpiState(e.row);
+    toast(st === "ready" ? "Claude is happy — tap Finish ✓" : st === "need-answer" ? "Answer Claude's question, then Finish" : "Checked");
+  } catch (err) { e.busy = false; render(); toast("Claude check failed: " + err.message); }
+}
+async function finishKpi() {
+  readKpiForm();
+  const st = kpiState(S.edit.row);
+  if (st === "need-reason") return toast("Add the reason (text, photo or voice) for this Amber/Red KPI.");
+  if (st === "need-next") return toast("Write the next step: what, who, by when.");
+  if (st === "need-check") return toast("Check with Claude first.");
+  if (st === "need-answer") return toast("Answer Claude's required question first.");
+  if (!(await saveKpi({ done: true }))) return;
+  const nxt = progress(S.dept).pending[0];
+  if (nxt) openKpi(nxt.item.id); else closeKpi();
+}
+
 /* ---------- proof attached to a KPI: voice note, photo or file (Supabase Storage bucket "evidence") ---------- */
 const MAX_MB = 10;
 const fmtSecs = (n) => `${Math.floor(n / 60)}:${String(Math.round(n % 60)).padStart(2, "0")}`;
@@ -355,33 +490,35 @@ function filesHtml(id, row, editable) {
     const label = kind === "voice" ? `Voice${f.secs ? " " + fmtSecs(f.secs) : ""}` : f.name || kind;
     return `<span class="fchip"><button class="link" data-act="open-file" data-path="${esc(f.path)}" title="Open ${esc(f.name || label)}">${icon} ${esc(label.length > 22 ? label.slice(0, 20) + "…" : label)}</button>${f.via === "whatsapp" ? '<span class="note"> WA</span>' : ""}${editable ? `<button class="x" data-act="rm-file" data-id="${esc(id)}" data-ix="${ix}" aria-label="Remove ${esc(label)}">✕</button>` : ""}</span>`;
   }).join("");
-  const tools = editable ? `<span class="ftools"><button class="btn small" data-act="rec" data-id="${esc(id)}" title="Record a voice note">🎤 Voice</button><button class="btn small" data-act="pick" data-kind="photo" data-id="${esc(id)}" title="Take or choose a photo">📷 Photo</button><button class="btn small" data-act="pick" data-kind="file" data-id="${esc(id)}" title="Attach a file (PDF, Excel, …)">📎 File</button></span>` : "";
+  const tools = editable ? `<span class="ftools"><button class="btn small" data-act="pick" data-kind="photo" data-id="${esc(id)}">📷 Photo</button><button class="btn small" data-act="pick" data-kind="file" data-id="${esc(id)}">📎 File / PDF</button><button class="btn small" data-act="rec" data-id="${esc(id)}">🎤 Voice</button></span>` : "";
   return chips + tools;
 }
 function refreshFiles(id) {
   const box = document.querySelector(`[data-files="${CSS.escape(id)}"]`);
-  if (box) box.innerHTML = filesHtml(id, S.form.rows[id] || {}, mayEditDept(S.dept));
+  if (box && S.edit) box.innerHTML = filesHtml(id, S.edit.row, mayEditDept(S.dept));
 }
 async function uploadProof(id, blob, name, extra = {}) {
+  if (!S.edit || S.edit.id !== id) return;
   if (blob.size > MAX_MB * 1024 * 1024) return toast(`That file is over ${MAX_MB} MB. Send a smaller one.`);
   const safe = String(name || "file").replace(/[^\w.\-]+/g, "_").slice(-60);
   const path = `${S.week}/${S.dept}/${id}/${Date.now()}-${safe}`;
   toast("Uploading…");
   const { error } = await supabase.storage.from("evidence").upload(path, blob, { contentType: blob.type || "application/octet-stream", upsert: false });
   if (error) return toast("Couldn't upload: " + error.message);
-  const row = (S.form.rows[id] = S.form.rows[id] || {});
-  row.files = [...filesOf(row), { path, name: safe, type: blob.type || "", size: blob.size, kind: kindOf(blob.type), at: nowIso(), via: "app", ...extra }];
-  markDirty(); refreshFiles(id);
-  toast("Attached. Save draft or submit to keep it.");
+  readKpiForm();
+  S.edit.row.files = [...filesOf(S.edit.row), { path, name: safe, type: blob.type || "", size: blob.size, kind: kindOf(blob.type), at: nowIso(), via: "app", ...extra }];
+  await saveKpi({ quiet: true });
+  render();
+  toast("Proof attached ✓");
 }
 function pickFile(id, kind) {
   const inp = document.createElement("input");
   inp.type = "file";
-  if (kind === "photo") inp.accept = "image/*";
+  inp.accept = kind === "photo" ? "image/*" : "image/*,application/pdf,.pdf,.xlsx,.xls,.csv,.doc,.docx,.txt";
   inp.onchange = () => { const f = inp.files && inp.files[0]; if (f) uploadProof(id, f, f.name); };
   inp.click();
 }
-let REC = null; // { id, rec, chunks, started, timer, btn }
+let REC = null;
 async function toggleRecording(id, btn) {
   if (REC) { const same = REC.id === id; REC.rec.stop(); if (same) return; }
   if (!navigator.mediaDevices || !window.MediaRecorder) return toast("This browser can't record. Use 📎 File to attach a recording instead.");
@@ -412,150 +549,44 @@ async function openFile(path) {
   if (w) w.location.href = data.signedUrl; else window.location.href = data.signedUrl;
 }
 async function removeFile(id, ix) {
-  const row = S.form.rows[id]; const f = filesOf(row)[ix]; if (!f) return;
+  const f = filesOf(S.edit && S.edit.row)[ix]; if (!f) return;
   confirmModal(`Remove ${f.name || "this attachment"}?`, "Remove", async () => {
     await supabase.storage.from("evidence").remove([f.path]);
-    row.files = filesOf(row).filter((_, i) => i !== ix); markDirty(); refreshFiles(id);
+    readKpiForm();
+    S.edit.row.files = filesOf(S.edit.row).filter((_, i) => i !== ix);
+    await saveKpi({ quiet: true }); render();
   });
-}
-function markDirty() { S.formDirty = true; const n = $("#dirtyNote"); if (n) n.textContent = "Unsaved changes"; }
-function bindSubmit() {
-  const tbl = $("#resTbl");
-  tbl && tbl.addEventListener("input", (e) => {
-    const tr = e.target.closest("tr[data-id]"); if (!tr) return;
-    const id = tr.dataset.id; const item = (S.depts[S.dept].items || []).find((i) => i.id === id);
-    const row = (S.form.rows[id] = S.form.rows[id] || {});
-    const fld = e.target.dataset.f; if (!fld) return;
-    if (fld === "ach") { const v = parseFloat(e.target.value); row.ach = isNaN(v) ? null : Math.min(Math.round(v), 120); }
-    else row[fld] = e.target.value;
-    if (fld === "actual" && !isManual(item)) {
-      row.ach = calcAch(item, row.actual);
-      const o = tr.querySelector('[data-out="ach"]'); if (o) o.textContent = row.ach != null ? row.ach + "%" : "—";
-    }
-    if (fld === "actual" || fld === "ach") {
-      const pill = tr.querySelector('[data-out="rag"]'); const st = statusOf(row);
-      if (pill) { pill.className = `pill ${st || "none"} locked`; pill.textContent = "🔒 " + (st ? RAGN[st] : "—"); }
-      const ph = st === "A" || st === "R";
-      const rs = tr.querySelector('[data-f="reason"]'); if (rs) rs.placeholder = ph ? "Reason (needed for Amber/Red)" : "Reason / remarks";
-      const nx = tr.querySelector('[data-f="next"]'); if (nx) nx.placeholder = ph ? "What, who, by when" : "Next step";
-    }
-    markDirty();
-  });
-  document.querySelectorAll("[data-pri]").forEach((el) => el.addEventListener("input", () => { S.form.priorities[+el.dataset.pri] = el.value; markDirty(); }));
-  const sp = $("#support"); sp && sp.addEventListener("input", () => { S.form.support = sp.value; markDirty(); });
-  const sa = $("#showAll"); sa && sa.addEventListener("change", () => { S.showAll = sa.checked; render(); });
-  document.querySelectorAll("[data-act-status]").forEach((el) => el.addEventListener("change", () => updateAction(el.dataset.actStatus, { status: el.value })));
-  document.querySelectorAll("[data-act-result]").forEach((el) => el.addEventListener("change", () => updateAction(el.dataset.actResult, { result: el.value })));
-  document.querySelectorAll("[data-ai-ans]").forEach((el) => el.addEventListener("input", () => { const x = S.form.ai && S.form.ai.flags[+el.dataset.aiAns]; if (x) { x.answer = el.value; markDirty(); } }));
-}
-async function saveResult(status) {
-  const d = S.depts[S.dept]; const f = S.form; const rows = {};
-  for (const [id, r] of Object.entries(f.rows)) {
-    const item = (d.items || []).find((i) => i.id === id); if (!item) continue;
-    if (!hasValue(r)) continue;
-    const ach = isManual(item) ? (typeof r.ach === "number" ? r.ach : null) : calcAch(item, r.actual);
-    rows[id] = { actual: isManual(item) ? "" : r.actual ?? "", ach, reason: r.reason || "", next: r.next || "", data: r.data || "", files: filesOf(r),
-      no: item.no, text: item.text, target: item.target, star: !!item.star, kraNo: item.kraNo, freq: item.freq };
-  }
-  if (status === "submitted") {
-    if (!Object.keys(rows).length) return toast("Enter at least one KPI result before submitting.");
-    const noWhy = Object.values(rows).filter((x) => ["A", "R"].includes(statusOf(x)) && !((x.reason || "").trim() || x.files.length) );
-    if (noWhy.length) return toast(`Give a reason (text, voice, photo or file) for Amber/Red KPI ${noWhy.map((x) => x.no).join(", ")}.`);
-    const noNext = Object.values(rows).filter((x) => ["A", "R"].includes(statusOf(x)) && !(x.next || "").trim());
-    if (noNext.length) return toast(`Write the next step for Amber/Red KPI ${noNext.map((x) => x.no).join(", ")}.`);
-    if (!f.ai) return toast("Check your results with Claude before submitting.");
-    if (f.ai.hash !== rowsHash(f.rows)) return toast("You changed figures after Claude's check. Check again before submitting.");
-    const openQ = (f.ai.flags || []).filter((x) => x.severity === "high" && !(x.answer || "").trim()).length;
-    if (openQ) return toast(`Answer Claude's ${openQ} key question${openQ > 1 ? "s" : ""} before submitting.`);
-  }
-  const sm = summarize(rows);
-  const ok = await run(supabase.from("results").upsert({
-    week: S.week, dept_id: S.dept, status, rows, priorities: f.priorities, support: f.support, score: sm.score, counts: sm.counts,
-    ai: f.ai || null, clar: f.clar || [], source: "app", updated_by: S.session.user.id, updated_at: nowIso(),
-  }, { onConflict: "week,dept_id" }), status === "submitted" ? `${d.name} results submitted` : "Draft saved");
-  if (!ok) return;
-  if (status === "submitted" && f.newActions.length) {
-    await run(supabase.from("actions").insert(f.newActions.map((a) => ({ dept_id: S.dept, week: S.week, kpi_no: a.kpiNo, kpi_text: a.kpiText, action: a.action, owner: a.owner, due: a.due || null, status: "Open" }))));
-  }
-  S.formDirty = false; S.form = null;
-  await Promise.all([loadResults(), loadActions()]); render();
 }
 async function updateAction(id, patch) {
   const ok = await run(supabase.from("actions").update({ ...patch, updated_at: nowIso() }).eq("id", id), "Action updated");
   if (ok) await loadActions();
 }
 
-/* ---------- Claude check (questions in Malayalam) ---------- */
-function aiPanel(editable) {
-  const f = S.form; const ai = f.ai;
-  if (!ai && !editable) return "";
-  const changed = ai && ai.hash !== rowsHash(f.rows);
-  const flags = (ai && ai.flags) || [];
-  const openQ = flags.filter((x) => x.severity === "high" && !(x.answer || "").trim()).length;
-  const dis = editable ? "" : "disabled";
-  return `<section class="panel ai" id="aiPanel">
-    <div class="head-row"><div><span class="ai-tag">Claude check</span><h3>Is this sheet result-oriented?</h3>
-      <p class="sub">Claude reads your figures before the MD office does, asks for data behind each claim (in Malayalam), and suggests improvements. Answer its questions, then submit.</p></div>
-      ${editable ? `<div class="toolbar"><button class="btn primary" data-act="ai-check" ${S.aiBusy ? "disabled" : ""}>${ai ? "Check again with Claude" : "Check with Claude"}</button></div>` : ""}</div>
-    ${S.aiBusy ? `<div class="thinking">Claude is reading ${esc(S.depts[S.dept].name)}'s results… this takes up to a minute.</div>` : ""}
-    ${ai ? `
-      ${changed ? `<div class="banner">Figures changed after this check. Check again before submitting.</div>` : ""}
-      <div class="toolbar"><span class="pill ${RATINGS[ai.rating] || "none"}">${esc(ai.rating || "—")}</span><span class="ml">${esc(RATING_ML[ai.rating] || "")}</span><b>Evidence ${ai.score != null ? esc(ai.score) + "/100" : "—"}</b><span class="note">checked ${esc(when(ai.at))}</span></div>
-      <p class="ml" style="margin:0">${esc(ai.summary || "")}</p>
-      ${flags.length ? `<h3>Questions to clarify ${openQ ? `<span class="pill R">${openQ} must answer</span>` : `<span class="pill G">All key questions answered</span>`}</h3>
-        <div class="flags">${flags.map((x, ix) => `<div class="flag ${esc(x.severity)}"><div class="toolbar"><span class="freq">${x.kpiNo ? "KPI " + esc(x.kpiNo) : "General"}</span><span class="note ml">${esc(x.issue || "")}</span></div>
-          <div class="q ml">${esc(x.question)}</div>
-          <textarea class="inp" data-ai-ans="${ix}" rows="2" aria-label="Your answer" placeholder="${x.severity === "high" ? "മറുപടി നിർബന്ധം · answer required" : "നിങ്ങളുടെ മറുപടി"}" ${dis}>${esc(x.answer || "")}</textarea></div>`).join("")}</div>` : `<p class="note">No questions. Claude found the sheet clear.</p>`}
-      ${(ai.suggestions || []).length ? `<h3>Suggestions</h3><ul class="ml" style="margin:0;padding-left:18px">${ai.suggestions.map((s) => `<li>${esc(s)}</li>`).join("")}</ul>` : ""}
-      ${f.clar.length ? `<details><summary class="note">Earlier answers (${f.clar.length})</summary><div class="flags" style="margin-top:8px">${f.clar.map((c) => `<div class="qa ml"><b>${c.kpiNo ? "KPI " + esc(c.kpiNo) + ": " : ""}${esc(c.question)}</b>${esc(c.answer)}</div>`).join("")}</div></details>` : ""}
-    ` : `<p class="note">Not checked yet.</p>`}
-  </section>`;
-}
-async function runCheck() {
-  const f = S.form; const d = S.depts[S.dept];
-  const rows = checkRows(d, f.rows);
-  if (!rows.length) return toast("Enter your results first, then ask Claude to check them.");
-  if (f.ai && f.ai.flags) for (const x of f.ai.flags) {
-    if ((x.answer || "").trim() && !f.clar.some((c) => c.question === x.question)) f.clar.push({ kpiNo: x.kpiNo || "", question: x.question, answer: x.answer.trim(), at: nowIso() });
-  }
-  S.aiBusy = true; render();
-  try {
-    const res = await callFn("ai-check", {
-      deptId: S.dept, deptName: d.name, hod: d.hod, week: weekRange(S.week), meeting: fmt(S.week), rows, missing: missingHeadline(d, f.rows),
-      priorities: f.priorities.filter(Boolean), support: f.support || "", clarifications: f.clar.map((c) => ({ kpi: c.kpiNo, q: c.question, a: c.answer })),
-    });
-    f.ai = { ...res, at: nowIso(), hash: rowsHash(f.rows), flags: (res.flags || []).map((x) => ({ ...x, answer: "" })) };
-    markDirty();
-  } catch (e) { toast("Claude check failed: " + e.message); }
-  finally { S.aiBusy = false; render(); const p = $("#aiPanel"); p && p.scrollIntoView({ block: "start", behavior: "smooth" }); }
-}
-
 /* ---------- MD office ---------- */
 function vMD() {
-  const ds = deptList(); const rv = S.review; const t = today(); const rr = repeatReds(S.depts, S.results, S.prev);
+  const ds = deptList(); const rv = S.review; const t0 = today(); const rr = repeatReds(S.depts, S.results, S.prev);
   const rows = ds.map((d) => {
-    const r = S.results[d.id]; const subm = r && r.status === "submitted"; const sm = r ? summarize(r.rows) : null; const ai = r && r.ai;
-    const unanswered = ai ? (ai.flags || []).filter((x) => !(x.answer || "").trim()).length : 0;
-    const answered = (r && r.clar ? r.clar.length : 0) + (ai ? (ai.flags || []).filter((x) => (x.answer || "").trim()).length : 0);
-    const od = S.actions.filter((a) => a.dept === d.id && a.status !== "Done" && a.due && a.due < t).length;
+    const r = S.results[d.id]; const pg = progress(d.id); const sm = r ? summarize(r.rows) : null; const t = claudeTally(r);
+    const od = S.actions.filter((a) => a.dept === d.id && a.status !== "Done" && a.due && a.due < t0).length;
     return `<tr><td><b>${esc(d.name)}</b><div class="who">${esc(d.hod || "")}</div></td>
-      <td>${subm ? `<span class="pill G">Submitted</span>` : r ? `<span class="pill A">Draft</span>` : `<span class="pill R">Missing</span>`}${viaBadge(r)}</td>
+      <td>${pg.complete ? `<span class="pill G">Done ✓</span>` : `<span class="pill ${pg.done ? "A" : "R"}">${pg.done}/${pg.total}</span>`}${viaBadge(r)}</td>
       <td>${sm && sm.score != null ? `<span class="pill ${sm.rag}">${sm.score}%</span>` : "—"}</td>
-      <td>${ai ? `<span class="pill ${RATINGS[ai.rating] || "none"}">${esc(ai.rating)}</span>` : `<span class="note">Not checked</span>`}</td>
-      <td>${ai && ai.score != null ? esc(ai.score) + "/100" : "—"}</td>
-      <td>${answered}${unanswered ? ` <span class="overdue">· ${unanswered} open</span>` : ""}</td>
+      <td>${t.ok + t.doubt + t.weak ? `<span class="pill G">${t.ok}</span> <span class="pill A">${t.doubt}</span> <span class="pill R">${t.weak}</span>` : `<span class="note">—</span>`}</td>
+      <td class="${t.mismatch ? "overdue" : ""}">${t.mismatch || "—"}</td>
+      <td>${t.open ? `<span class="overdue">${t.open} open</span>` : "—"}</td>
       <td class="${od ? "overdue" : ""}">${od}</td>
       <td>${rr.filter((x) => x.dept === d.id).length || "—"}</td></tr>`;
   }).join("");
   const clarHtml = ds.map((d) => {
     const r = S.results[d.id]; if (!r) return "";
-    const qa = [...(r.clar || []), ...((r.ai && r.ai.flags) || []).map((x) => ({ kpiNo: x.kpiNo, question: x.question, answer: x.answer }))];
+    const qa = [...Object.values(r.rows || {}).flatMap((x) => ((x.ai && x.ai.questions) || []).map((q) => ({ kpiNo: x.no, question: q.q, answer: q.answer }))),
+      ...(r.clar || []), ...((r.ai && r.ai.flags) || []).map((x) => ({ kpiNo: x.kpiNo, question: x.question, answer: x.answer }))];
     if (!qa.length) return "";
     return `<div class="rv-dept"><h3>${esc(d.name)}</h3><div class="flags">${qa.map((c) => `<div class="qa ml"><b>${c.kpiNo ? "KPI " + esc(c.kpiNo) + ": " : ""}${esc(c.question)}</b>${(c.answer || "").trim() ? esc(c.answer) : `<span class="overdue">Not answered</span>`}</div>`).join("")}</div></div>`;
   }).join("");
   return `<section class="panel">
     <div class="head-row"><div><h2>MD Office monitoring</h2><p class="sub">Week ${esc(weekRange(S.week))}. How each department reported: results or just duty, whether the data backs the claims, and what Claude asked them to clarify.</p></div></div>
-    <div class="tbl-wrap"><table class="resp"><thead><tr><th>Department</th><th>Sheet</th><th>KPI score</th><th>Claude rating</th><th>Evidence</th><th>Clarified</th><th>Overdue actions</th><th>Red 2 weeks</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="tbl-wrap"><table class="resp"><thead><tr><th>Department</th><th>KPIs done</th><th>KPI score</th><th>Claude: clear / doubt / weak</th><th>Proof ≠ figure</th><th>Unanswered</th><th>Overdue actions</th><th>Red 2 weeks</th></tr></thead><tbody>${rows}</tbody></table></div>
     ${rr.length ? `<div class="banner"><b>Red two weeks running:</b> ${rr.map((x) => `${esc(x.name)} ${esc(x.no)} (${esc(x.text)})`).join(" · ")}</div>` : ""}
   </section>
   <section class="panel ai">
@@ -571,14 +602,14 @@ function vMD() {
 function mdReviewHtml(rv) {
   const nm = (id) => (S.depts[id] || {}).name || id;
   return `<p class="note">Generated ${esc(new Date(rv.at).toLocaleString("en-IN"))}</p>
-    <p style="margin:0;font-size:16px"><b>${esc(rv.headline || "")}</b></p>
-    <p style="margin:0">${esc(rv.groupView || "")}</p>
-    ${(rv.watchList || []).length ? `<div><h3>Watch list</h3><ul style="margin:6px 0 0;padding-left:18px">${rv.watchList.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>` : ""}
+    <p class="ml" style="margin:0;font-size:16px"><b>${esc(rv.headline || "")}</b></p>
+    <p class="ml" style="margin:0">${esc(rv.groupView || "")}</p>
+    ${(rv.watchList || []).length ? `<div><h3>Watch list</h3><ul class="ml" style="margin:6px 0 0;padding-left:18px">${rv.watchList.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>` : ""}
     ${(rv.departments || []).map((x) => `<div class="rv-dept"><div class="toolbar"><h3>${esc(nm(x.dept))}</h3><span class="pill ${RATINGS[x.rating] || "none"}">${esc(x.rating || "")}</span></div>
-      <p style="margin:0">${esc(x.verdict || "")}</p>
-      ${(x.questions || []).length ? `<div><b>Ask on Monday</b><ul>${x.questions.map((q) => `<li>${esc(q)}</li>`).join("")}</ul></div>` : ""}
-      ${(x.suggestions || []).length ? `<div><b>Suggestions</b><ul>${x.suggestions.map((q) => `<li>${esc(q)}</li>`).join("")}</ul></div>` : ""}</div>`).join("")}
-    ${(rv.crossDept || []).length ? `<div class="rv-dept"><h3>Across departments</h3><ul>${rv.crossDept.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>` : ""}`;
+      <p class="ml" style="margin:0">${esc(x.verdict || "")}</p>
+      ${(x.questions || []).length ? `<div><b>Ask on Monday</b><ul class="ml">${x.questions.map((q) => `<li>${esc(q)}</li>`).join("")}</ul></div>` : ""}
+      ${(x.suggestions || []).length ? `<div><b>Suggestions</b><ul class="ml">${x.suggestions.map((q) => `<li>${esc(q)}</li>`).join("")}</ul></div>` : ""}</div>`).join("")}
+    ${(rv.crossDept || []).length ? `<div class="rv-dept"><h3>Across departments</h3><ul class="ml">${rv.crossDept.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>` : ""}`;
 }
 async function runMdReview() {
   S.mdBusy = true; render();
@@ -706,7 +737,7 @@ function vSettings() {
   return `<section class="panel"><div class="head-row"><div><h2>WhatsApp &amp; Saturday schedule</h2><p class="sub">Every Saturday: 9:30 AM the bot asks each HOD · 1:30 PM reminder to those not finished · 4:30 PM Claude's MD review · 5 PM the PPT goes to the numbers below.</p></div></div>
     <form class="form-grid" id="stForm" novalidate>
       <label class="f wide">WhatsApp numbers that get the Saturday PPT (comma separated)<input class="inp" id="stNums" inputmode="tel" value="${esc((st.report_numbers || []).map((n) => n.replace(/^91/, "")).join(", "))}" placeholder="98765 43210, 98470 12345"></label>
-      <label class="f">The bot asks<select class="inp" id="stScope"><option value="weekly" ${st.bot_scope === "weekly" ? "selected" : ""}>All weekly KPIs</option><option value="headline" ${st.bot_scope === "headline" ? "selected" : ""}>Only ★ headline KPIs</option></select></label>
+      <label class="f">HODs must finish<select class="inp" id="stScope"><option value="weekly" ${st.bot_scope === "weekly" ? "selected" : ""}>All weekly KPIs</option><option value="headline" ${st.bot_scope === "headline" ? "selected" : ""}>Only ★ headline KPIs</option></select></label>
       <label class="f">Kickoff template name<input class="inp" id="stTs" value="${esc(st.tpl_start)}"></label>
       <label class="f">PPT template name<input class="inp" id="stTr" value="${esc(st.tpl_report)}"></label>
       <label class="f">Template language code<input class="inp" id="stTl" value="${esc(st.tpl_lang)}"></label>
@@ -859,26 +890,23 @@ function resetPwModal(id) {
 $("#main").addEventListener("click", async (e) => {
   const b = e.target.closest("[data-act]"); if (!b) return;
   const a = b.dataset.act;
-  if (a === "goto-submit") { S.dept = b.dataset.dept; LS.set("dept", S.dept); S.tab = "submit"; LS.set("tab", "submit"); S.form = null; render(); window.scrollTo(0, 0); }
-  else if (a === "set-dept") {
-    const go = () => { S.formDirty = false; S.form = null; S.dept = b.dataset.dept; LS.set("dept", S.dept); render(); };
-    if (S.formDirty) return confirmModal("Leave without saving this department's changes?", "Leave", go);
-    go();
+  if (a === "goto-submit") { S.dept = b.dataset.dept; LS.set("dept", S.dept); S.tab = "submit"; LS.set("tab", "submit"); S.kpiOpen = null; render(); window.scrollTo(0, 0); }
+  else if (a === "set-dept") { S.kpiOpen = null; S.edit = null; S.dept = b.dataset.dept; LS.set("dept", S.dept); render(); }
+  else if (a === "open-kpi") openKpi(b.dataset.id);
+  else if (a === "close-kpi") {
+    if (S.edit && S.edit.dirty) return confirmModal("Save your changes to this KPI?", "Save", async () => { await saveKpi(); closeKpi(); });
+    closeKpi();
   }
-  else if (a === "ppt") makePpt();
+  else if (a === "save-kpi") { if (await saveKpi()) render(); }
+  else if (a === "finish-kpi") finishKpi();
+  else if (a === "kpi-check") { if (S.edit && !S.edit.busy) kpiCheck(); }
+  else if (a === "save-plan") savePlan();
+  else if (a === "my-ppt") makePpt(S.dept);
+  else if (a === "ppt") makePpt(null);
   else if (a === "rec") toggleRecording(b.dataset.id, b);
   else if (a === "pick") pickFile(b.dataset.id, b.dataset.kind);
   else if (a === "open-file") openFile(b.dataset.path);
   else if (a === "rm-file") removeFile(b.dataset.id, +b.dataset.ix);
-  else if (a === "save-draft") saveResult("draft");
-  else if (a === "submit") saveResult("submitted");
-  else if (a === "add-new") {
-    const text = $("#naText").value.trim(); if (!text) return toast("Describe the action.");
-    const kid = $("#naKpi").value; const it = kid ? (S.depts[S.dept].items || []).find((i) => i.id === kid) : null;
-    S.form.newActions.push({ kpiNo: it ? it.no : "", kpiText: it ? it.text : "", action: text, owner: $("#naOwner").value.trim(), due: $("#naDue").value });
-    markDirty(); render();
-  }
-  else if (a === "rm-new") { S.form.newActions.splice(+b.dataset.ix, 1); render(); }
   else if (a === "wdept") { S.weeklyDept = b.dataset.dept; LS.set("wdept", S.weeklyDept); render(); }
   else if (a === "mdept") { S.masterDept = b.dataset.dept; LS.set("mdept", S.masterDept); render(); }
   else if (a === "add-kpi") kpiModal(S.masterDept, null);
@@ -898,7 +926,6 @@ $("#main").addEventListener("click", async (e) => {
   else if (a === "add-action") actionModal();
   else if (a === "del-action") confirmModal("Delete this action?", "Delete", async () => { if (await run(supabase.from("actions").delete().eq("id", b.dataset.id), "Action deleted")) { await loadActions(); render(); } });
   else if (a === "pfilter") { S.pendFilter = b.dataset.k; render(); }
-  else if (a === "ai-check") { if (!S.aiBusy) runCheck(); }
   else if (a === "md-review") { if (!S.mdBusy) runMdReview(); }
   else if (a === "gen-pw") { $("#nuPw").value = genPw(); }
   else if (a === "reset-pw") resetPwModal(b.dataset.id);
@@ -950,14 +977,34 @@ $("#main").addEventListener("change", (e) => {
 });
 
 /* ---------- PowerPoint (same builder as the Saturday 5 PM job) ---------- */
-async function makePpt() {
+async function makePpt(onlyDept) {
   const btn = $("#pptBtn"); btn.disabled = true; const old = btn.textContent; btn.textContent = "Building…";
   try {
-    const deck = buildDeck(PptxGenJS, { week: S.week, depts: S.depts, results: S.results, prev: S.prev, actions: S.actions, review: S.review, today: today() });
-    await deck.writeFile({ fileName: `HOD-Review-${S.week}.pptx` });
+    const depts = onlyDept ? { [onlyDept]: S.depts[onlyDept] } : S.depts;
+    const results = onlyDept ? (S.results[onlyDept] ? { [onlyDept]: S.results[onlyDept] } : {}) : S.results;
+    const { proofs, links } = await gatherProof(results);
+    const deck = buildDeck(PptxGenJS, { week: S.week, depts, results, prev: S.prev, actions: S.actions, review: onlyDept ? null : S.review, today: today(), proofs, links, single: !!onlyDept, scope: scopeNow() });
+    await deck.writeFile({ fileName: onlyDept ? `KPI-${S.depts[onlyDept].name.replace(/\W+/g, "-")}-${S.week}.pptx` : `HOD-Review-${S.week}.pptx` });
     toast("PowerPoint downloaded");
   } catch (e) { toast("Couldn't make the PPT: " + ((e && e.message) || "try again")); }
   finally { btn.disabled = false; btn.textContent = old; }
+}
+/** Photos go into the deck as pictures; every attachment also gets a link (valid 7 days). */
+async function gatherProof(results) {
+  const proofs = {}, links = {}; const files = [];
+  Object.values(results).forEach((r) => Object.values(r.rows || {}).forEach((x) => filesOf(x).forEach((f) => files.push(f))));
+  if (!files.length) return { proofs, links };
+  const { data } = await supabase.storage.from("evidence").createSignedUrls(files.map((f) => f.path), 7 * 24 * 3600);
+  (data || []).forEach((u) => { if (u && u.signedUrl) links[u.path] = u.signedUrl; });
+  const pics = files.filter((f) => (f.kind || kindOf(f.type)) === "photo" && links[f.path]).slice(0, 40);
+  await Promise.all(pics.map(async (f) => {
+    try {
+      const b = await (await fetch(links[f.path])).blob();
+      if (b.size > 4e6) return;
+      proofs[f.path] = await new Promise((ok) => { const fr = new FileReader(); fr.onload = () => ok(fr.result); fr.readAsDataURL(b); });
+    } catch (e) { /* skip this picture */ }
+  }));
+  return { proofs, links };
 }
 
 /* ---------- start ---------- */

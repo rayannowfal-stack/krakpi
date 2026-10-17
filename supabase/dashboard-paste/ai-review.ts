@@ -37,7 +37,7 @@ function claudeHeaders(key) {
   if (ws) h["anthropic-workspace-id"] = ws.trim();
   return h;
 }
-async function askClaudeJson(prompt, opts) {
+async function askClaudeJson(prompt, opts, attachments = []) {
   const key = Deno.env.get("ANTHROPIC_API_KEY");
   if (!key) throw new HttpError(500, "Claude is not set up: add the ANTHROPIC_API_KEY secret in Supabase.");
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -46,7 +46,7 @@ async function askClaudeJson(prompt, opts) {
     body: JSON.stringify({
       model: opts.model,
       max_tokens: opts.maxTokens,
-      messages: [{ role: "user", content: prompt + "\n\nReply with the JSON object only \u2014 no other text." }]
+      messages: [{ role: "user", content: attachments.length ? [...attachments, { type: "text", text: prompt + "\n\nReply with the JSON object only \u2014 no other text." }] : prompt + "\n\nReply with the JSON object only \u2014 no other text." }]
     })
   });
   if (!res.ok) {
@@ -208,8 +208,24 @@ function reviewDepartments({ depts, results, prev, actions, today }) {
       score: r ? summarize(r.rows).score : null,
       lastWeekScore: p ? summarize(p.rows).score : null,
       claudeCheck: r && r.ai ? { rating: r.ai.rating, evidenceScore: r.ai.score, summary: r.ai.summary } : null,
-      rows: r ? Object.values(r.rows || {}).map((x) => ({ no: x.no, kpi: x.text, target: x.target, actual: x.actual, ach: x.ach, status: RAGN[statusOf(x)] || "", reason: x.reason, data: x.data, nextStep: x.next || "", attached: filesSummary(x) })) : [],
-      clarifications: r ? [...r.clar || [], ...r.ai && r.ai.flags || []].map((c) => ({ kpi: c.kpiNo, q: c.question, a: c.answer || "NOT ANSWERED" })) : [],
+      rows: r ? Object.values(r.rows || {}).map((x) => ({
+        no: x.no,
+        kpi: x.text,
+        target: x.target,
+        actual: x.actual,
+        ach: x.ach,
+        status: RAGN[statusOf(x)] || "",
+        reason: x.reason || x.data || "",
+        nextStep: x.next || "",
+        attached: filesSummary(x),
+        claude: x.ai ? { verdict: x.ai.verdict, proof: x.ai.proof || null, note: x.ai.summary } : null,
+        finished: !!x.done
+      })) : [],
+      clarifications: r ? [
+        ...Object.values(r.rows || {}).flatMap((x) => (x.ai && x.ai.questions || []).map((q) => ({ kpi: x.no, q: q.q, a: q.answer || "NOT ANSWERED" }))),
+        ...r.clar || [],
+        ...r.ai && r.ai.flags || []
+      ].map((c) => ({ kpi: c.kpi || c.kpiNo, q: c.q || c.question, a: c.a || c.answer || "NOT ANSWERED" })) : [],
       priorities: r ? (r.priorities || []).filter(Boolean) : [],
       support: r ? r.support : "",
       openActions: actions.filter((a) => a.dept === d.id && a.status !== "Done").map((a) => ({ action: a.action, owner: a.owner, due: a.due, overdue: !!(a.due && a.due < today), status: a.status }))
@@ -260,7 +276,10 @@ For each department judge:
 - Did the HOD answer Claude's clarification questions properly, or dodge them? (Answers may be in Malayalam.)
 - Trend vs last week's score, overdue actions, KPIs Red two weeks running.
 - A department with a missing sheet should be called out.
-Questions for Monday must be direct and specific to a KPI or figure. Suggestions must be practical for a textile retail chain. Simple English. Never invent figures not in the data.
+- Each KPI row may carry "claude": what Claude found when the HOD finished that KPI (verdict ok/doubt/weak, and "proof" = what Claude read in the attached photo/PDF, with "matches" true/false against the HOD's figure). A proof that does not match the figure is a serious point for the MD.
+Questions for Monday must be direct and specific to a KPI or figure. Suggestions must be practical for a textile retail chain. Never invent figures not in the data.
+
+LANGUAGE: Write "headline", "groupView", every "watchList" item, every "verdict", every "question", every "suggestion" and every "crossDept" item in simple, clear MALAYALAM (Malayalam script), the way the MD office talks to its managers. Keep numbers, KPI numbers, department names and business terms (ATV, UPT, GP, PO, GRN, KPI) in English inside the Malayalam sentence. "rating" stays exactly one of the three English labels, and "dept" stays the id from the data.
 
 Week: ${str(b.weekLabel, 40)} (meeting ${str(b.meeting, 40)})
 Red two weeks running: ${JSON.stringify(strArr(b.repeatReds, 60))}

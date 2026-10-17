@@ -404,6 +404,64 @@ create trigger results_lock_status before insert or update on public.results
 -- clean statuses chosen by hand before this version
 update public.results set rows = rows where rows::text like '%"rag"%';
 
+-- ============ Version 3: one KPI at a time ============
+
+-- Score and Green/Amber/Red counts are always worked out here from the achievement %, so every screen agrees.
+create or replace function public.results_summary() returns trigger
+language plpgsql as $$
+declare v jsonb; a numeric; n int := 0; tot numeric := 0; g int := 0; am int := 0; r int := 0;
+begin
+  for v in select value from jsonb_each(coalesce(new.rows, '{}'::jsonb)) loop
+    if jsonb_typeof(v) = 'object' and jsonb_typeof(v->'ach') = 'number' then
+      a := (v->>'ach')::numeric; n := n + 1; tot := tot + least(a, 120);
+      if a >= 95 then g := g + 1; elsif a >= 80 then am := am + 1; else r := r + 1; end if;
+    end if;
+  end loop;
+  new.score := case when n > 0 then round(tot / n) else null end;
+  new.counts := jsonb_build_object('G', g, 'A', am, 'R', r);
+  return new;
+end $$;
+drop trigger if exists results_summary on public.results;
+create trigger results_summary before insert or update on public.results
+  for each row execute function public.results_summary();
+
+-- Next steps of finished Amber/Red KPIs become Pending points automatically (one per KPI per week).
+alter table public.actions add column if not exists auto_key text;
+create unique index if not exists actions_auto_key on public.actions(auto_key) where auto_key is not null;
+
+-- Saves ONE KPI into the week's sheet without touching the others (app and WhatsApp can work at the same time).
+-- Runs with the caller's own permissions: a HOD can only save their own department.
+create or replace function public.save_kpi(p_week date, p_dept text, p_kpi text, p_row jsonb, p_source text default 'app', p_complete boolean default null)
+returns void language plpgsql security invoker set search_path = public as $$
+declare a numeric;
+begin
+  insert into public.results (week, dept_id, status, rows, source, updated_by, updated_at)
+  values (p_week, p_dept, case when p_complete then 'submitted' else 'draft' end, jsonb_build_object(p_kpi, p_row), coalesce(p_source, 'app'), auth.uid(), now())
+  on conflict (week, dept_id) do update set
+    rows = coalesce(public.results.rows, '{}'::jsonb) || jsonb_build_object(p_kpi, p_row),
+    status = case when p_complete is null then public.results.status when p_complete then 'submitted' else 'draft' end,
+    source = coalesce(p_source, public.results.source),
+    updated_by = coalesce(auth.uid(), public.results.updated_by),
+    updated_at = now();
+  if coalesce((p_row->>'done')::boolean, false) and jsonb_typeof(p_row->'ach') = 'number' and coalesce(trim(p_row->>'next'), '') <> '' then
+    a := (p_row->>'ach')::numeric;
+    if a < 95 then
+      insert into public.actions (dept_id, week, kpi_no, kpi_text, action, status, auto_key)
+      values (p_dept, p_week, coalesce(p_row->>'no', ''), coalesce(p_row->>'text', ''), p_row->>'next', 'Open', p_week || '|' || p_dept || '|' || p_kpi)
+      on conflict (auto_key) where auto_key is not null do update set action = excluded.action, updated_at = now()
+      where public.actions.status <> 'Done';
+    end if;
+  end if;
+end $$;
+grant execute on function public.save_kpi(date, text, text, jsonb, text, boolean) to authenticated;
+
+-- Which KPIs HODs must finish each week: 'weekly' = all daily/weekly KPIs, 'headline' = only ★ ones (Settings).
+create or replace function public.kpi_scope() returns text
+language sql stable security definer set search_path = public as $$
+  select coalesce((select bot_scope from public.app_settings where id = 1), 'weekly');
+$$;
+grant execute on function public.kpi_scope() to authenticated;
+
 -- ============ Live updates ============
 do $$
 declare t text;

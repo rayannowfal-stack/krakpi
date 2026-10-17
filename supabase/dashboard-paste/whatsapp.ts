@@ -18,7 +18,7 @@ function claudeHeaders(key) {
   if (ws) h["anthropic-workspace-id"] = ws.trim();
   return h;
 }
-async function askClaudeJson(prompt, opts) {
+async function askClaudeJson(prompt, opts, attachments = []) {
   const key = Deno.env.get("ANTHROPIC_API_KEY");
   if (!key) throw new HttpError(500, "Claude is not set up: add the ANTHROPIC_API_KEY secret in Supabase.");
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -27,7 +27,7 @@ async function askClaudeJson(prompt, opts) {
     body: JSON.stringify({
       model: opts.model,
       max_tokens: opts.maxTokens,
-      messages: [{ role: "user", content: prompt + "\n\nReply with the JSON object only \u2014 no other text." }]
+      messages: [{ role: "user", content: attachments.length ? [...attachments, { type: "text", text: prompt + "\n\nReply with the JSON object only \u2014 no other text." }] : prompt + "\n\nReply with the JSON object only \u2014 no other text." }]
     })
   });
   if (!res.ok) {
@@ -114,12 +114,9 @@ async function validSignature(raw, header) {
 
 // supabase/functions/_shared/core.js
 var FREQ = { D: "Daily", W: "Weekly", "15D": "15 days", M: "Monthly", Q: "Quarterly", H: "Half-yearly", Y: "Yearly", AN: "As needed" };
-var FREQ_ML = { D: "\u0D26\u0D3F\u0D35\u0D38\u0D35\u0D41\u0D02", W: "\u0D06\u0D34\u0D4D\u0D1A\u0D24\u0D4B\u0D31\u0D41\u0D02", "15D": "15 \u0D26\u0D3F\u0D35\u0D38\u0D02", M: "\u0D2E\u0D3E\u0D38\u0D02\u0D24\u0D4B\u0D31\u0D41\u0D02", Q: "\u0D24\u0D4D\u0D30\u0D48\u0D2E\u0D3E\u0D38\u0D02", H: "\u0D05\u0D7C\u0D27\u0D35\u0D3E\u0D7C\u0D37\u0D3F\u0D15\u0D02", Y: "\u0D35\u0D3E\u0D7C\u0D37\u0D3F\u0D15\u0D02", AN: "\u0D06\u0D35\u0D36\u0D4D\u0D2F\u0D3E\u0D28\u0D41\u0D38\u0D30\u0D23\u0D02" };
 var WEEKLY = /* @__PURE__ */ new Set(["D", "W", "15D"]);
 var RAGN = { G: "Green", A: "Amber", R: "Red", NA: "No data" };
 var RAG_ML = { G: "\u0D2A\u0D1A\u0D4D\u0D1A (Green)", A: "\u0D2E\u0D1E\u0D4D\u0D1E (Amber)", R: "\u0D1A\u0D41\u0D35\u0D2A\u0D4D\u0D2A\u0D4D (Red)", NA: "\u0D21\u0D3E\u0D31\u0D4D\u0D31 \u0D07\u0D32\u0D4D\u0D32" };
-var RATINGS2 = { "Result-oriented": "G", "Partly result-oriented": "A", "Activity only": "R" };
-var RATING_ML = { "Result-oriented": "\u0D2B\u0D32\u0D3E\u0D27\u0D3F\u0D37\u0D4D\u0D20\u0D3F\u0D24\u0D02", "Partly result-oriented": "\u0D2D\u0D3E\u0D17\u0D3F\u0D15\u0D2E\u0D3E\u0D2F\u0D3F \u0D2B\u0D32\u0D3E\u0D27\u0D3F\u0D37\u0D4D\u0D20\u0D3F\u0D24\u0D02", "Activity only": "\u0D1C\u0D4B\u0D32\u0D3F \u0D1A\u0D46\u0D2F\u0D4D\u0D24\u0D41 \u0D0E\u0D28\u0D4D\u0D28\u0D4D \u0D2E\u0D3E\u0D24\u0D4D\u0D30\u0D02" };
 var pad = (n) => String(n).padStart(2, "0");
 var ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 var parseYmd = (s) => {
@@ -193,12 +190,57 @@ function summarize(rows) {
   const score = n ? Math.round(sum / n) : null;
   return { score, counts: c, rag: score == null ? "none" : ragOf(score) };
 }
-var hasValue = (r) => !!r && !!(r.actual || r.reason || r.data || r.next || r.ach != null || filesOf(r).length);
-function rowsHash(rows) {
-  return Object.keys(rows || {}).sort().map((k) => {
-    const r = rows[k];
-    return [k, r.actual ?? "", r.ach ?? "", r.reason || "", r.data || "", r.next || "", filesOf(r).map((f) => f.path).join(",")].join("|");
-  }).join("~");
+var isPct = (item) => /%/.test(String(item && item.target || "")) || isManual(item);
+var answerKind = (item) => isPct(item) ? "pct" : "count";
+function resultFrom(item, input) {
+  const t = String(input ?? "").replace(/rs\.?\s*/ig, "").replace(/₹/g, "").trim();
+  if (!t) return null;
+  const of = t.match(/(\d[\d,]*(?:\.\d+)?)\s*(?:\/|of|ൽ|-ൽ|out of)\s*(\d[\d,]*(?:\.\d+)?)/i);
+  const num = (x) => parseFloat(String(x).replace(/,/g, ""));
+  if (of && isPct(item)) {
+    const a = num(of[1]), b = num(of[2]);
+    if (!(b > 0)) return null;
+    const pct = Math.round(a / b * 1e3) / 10;
+    const ach = isManual(item) ? Math.min(Math.round(pct), 120) : calcAch(item, pct);
+    return { actual: `${of[1].replace(/,/g, "")}/${of[2].replace(/,/g, "")}`, ach, pct };
+  }
+  const m = t.match(/-?\d[\d,]*(?:\.\d+)?/);
+  if (!m) return null;
+  const v = m[0].replace(/,/g, "");
+  if (isManual(item)) return { actual: v + "%", ach: Math.max(0, Math.min(Math.round(num(v)), 120)) };
+  return { actual: v, ach: calcAch(item, v) };
+}
+var kpiHash = (r) => [r && r.actual || "", r && r.ach != null ? r.ach : "", r && r.reason || "", r && r.next || "", filesOf(r).map((f) => f.path).join(",")].join("|");
+function kpiState(r) {
+  if (!r || r.ach == null && !r.actual) return "todo";
+  const bad = ["A", "R"].includes(statusOf(r));
+  if (bad && !((r.reason || "").trim() || filesOf(r).length)) return "need-reason";
+  if (bad && !(r.next || "").trim()) return "need-next";
+  if (!r.ai || r.ai.hash !== kpiHash(r)) return "need-check";
+  if ((r.ai.questions || []).some((q) => q.severity === "high" && !(q.answer || "").trim())) return "need-answer";
+  return r.done ? "done" : "ready";
+}
+function progressOf(dept, rows, scope = "weekly") {
+  let items = itemsFor(dept, false);
+  if (scope === "headline") items = items.filter((i) => i.star);
+  const list = items.map((i) => ({ item: i, row: (rows || {})[i.id] || null, state: kpiState((rows || {})[i.id]) }));
+  const done = list.filter((x) => x.state === "done").length;
+  return { list, done, total: list.length, pending: list.filter((x) => x.state !== "done"), complete: list.length > 0 && done === list.length };
+}
+function kpiCheckInput(item, row) {
+  return {
+    no: item.no,
+    kpi: item.text,
+    target: item.target,
+    frequency: FREQ[item.freq] || item.freq,
+    headline: !!item.star,
+    answer: row.actual || "",
+    achievement: row.ach != null ? row.ach + "%" : "",
+    status: RAGN[statusOf(row)] || "",
+    reason: row.reason || "",
+    nextStep: row.next || "",
+    attached: filesSummary(row)
+  };
 }
 function sortItems(items) {
   return items.slice().sort((a, b) => (b.star ? 1 : 0) - (a.star ? 1 : 0) || a.kraNo - b.kraNo || String(a.no).localeCompare(String(b.no), void 0, { numeric: true }));
@@ -257,18 +299,6 @@ function repeatReds(depts, results, prev) {
   });
   return out;
 }
-function checkRows(dept, rows) {
-  const out = [];
-  for (const i of dept && dept.items || []) {
-    const r = rows[i.id];
-    if (!hasValue(r)) continue;
-    out.push({ no: i.no, kpi: i.text, target: i.target, freq: FREQ[i.freq] || i.freq, headline: !!i.star, actual: r.actual || "", achievement: r.ach != null ? r.ach + "%" : "", status: RAGN[statusOf(r)] || "", reason: r.reason || "", data: r.data || "", nextStep: r.next || "", attached: filesSummary(r) });
-  }
-  return out;
-}
-function missingHeadline(dept, rows) {
-  return (dept && dept.items || []).filter((i) => i.star && WEEKLY.has(i.freq) && !hasValue(rows[i.id])).map((i) => `${i.no} ${i.text}`);
-}
 function reviewDepartments({ depts, results, prev, actions, today }) {
   return deptListOf(depts).map((d) => {
     const r = results[d.id];
@@ -282,8 +312,24 @@ function reviewDepartments({ depts, results, prev, actions, today }) {
       score: r ? summarize(r.rows).score : null,
       lastWeekScore: p ? summarize(p.rows).score : null,
       claudeCheck: r && r.ai ? { rating: r.ai.rating, evidenceScore: r.ai.score, summary: r.ai.summary } : null,
-      rows: r ? Object.values(r.rows || {}).map((x) => ({ no: x.no, kpi: x.text, target: x.target, actual: x.actual, ach: x.ach, status: RAGN[statusOf(x)] || "", reason: x.reason, data: x.data, nextStep: x.next || "", attached: filesSummary(x) })) : [],
-      clarifications: r ? [...r.clar || [], ...r.ai && r.ai.flags || []].map((c) => ({ kpi: c.kpiNo, q: c.question, a: c.answer || "NOT ANSWERED" })) : [],
+      rows: r ? Object.values(r.rows || {}).map((x) => ({
+        no: x.no,
+        kpi: x.text,
+        target: x.target,
+        actual: x.actual,
+        ach: x.ach,
+        status: RAGN[statusOf(x)] || "",
+        reason: x.reason || x.data || "",
+        nextStep: x.next || "",
+        attached: filesSummary(x),
+        claude: x.ai ? { verdict: x.ai.verdict, proof: x.ai.proof || null, note: x.ai.summary } : null,
+        finished: !!x.done
+      })) : [],
+      clarifications: r ? [
+        ...Object.values(r.rows || {}).flatMap((x) => (x.ai && x.ai.questions || []).map((q) => ({ kpi: x.no, q: q.q, a: q.answer || "NOT ANSWERED" }))),
+        ...r.clar || [],
+        ...r.ai && r.ai.flags || []
+      ].map((c) => ({ kpi: c.kpi || c.kpiNo, q: c.q || c.question, a: c.a || c.answer || "NOT ANSWERED" })) : [],
       priorities: r ? (r.priorities || []).filter(Boolean) : [],
       support: r ? r.support : "",
       openActions: actions.filter((a) => a.dept === d.id && a.status !== "Done").map((a) => ({ action: a.action, owner: a.owner, due: a.due, overdue: !!(a.due && a.due < today), status: a.status }))
@@ -292,43 +338,84 @@ function reviewDepartments({ depts, results, prev, actions, today }) {
 }
 
 // supabase/functions/_shared/ai.ts
-async function checkSheet(b, maxFlags = 8) {
-  const prompt = `You review a weekly KPI result sheet that a Head of Department (HOD) at Atlas Maharani Group (textile retail, Kerala, many showrooms) will present to the MD office on Monday. Your job: make sure the results are reported in a RESULT-ORIENTED way, not as routine duty, and ask clarification questions where a result is unclear or unsupported.
+var IMG = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+function b64(bytes) {
+  let s = "";
+  const CH = 32768;
+  for (let i = 0; i < bytes.length; i += CH) s += String.fromCharCode(...bytes.subarray(i, i + CH));
+  return btoa(s);
+}
+async function proofBlocks(storage, files) {
+  const blocks = [];
+  const notes = [];
+  let total = 0;
+  for (const f of (files || []).slice(0, 6)) {
+    const type = String(f.type || "").split(";")[0].toLowerCase();
+    const label = f.name || f.path.split("/").pop();
+    if (f.kind === "voice" || type.startsWith("audio/")) {
+      notes.push(`${label}: voice note (Claude cannot listen to audio)`);
+      continue;
+    }
+    const readable = IMG.includes(type) || type === "application/pdf" || type.startsWith("text/") || type === "application/csv";
+    if (!readable) {
+      notes.push(`${label}: ${type || "file"} (cannot be opened by Claude)`);
+      continue;
+    }
+    if (blocks.length >= 4) {
+      notes.push(`${label}: not read (only 4 files are read per KPI)`);
+      continue;
+    }
+    const { data, error } = await storage.from("evidence").download(f.path);
+    if (error || !data) {
+      notes.push(`${label}: could not be downloaded`);
+      continue;
+    }
+    const bytes = new Uint8Array(await data.arrayBuffer());
+    const limit = IMG.includes(type) ? 37e5 : type === "application/pdf" ? 12e6 : 2e5;
+    if (bytes.length > limit || total + bytes.length > 2e7) {
+      notes.push(`${label}: too big for Claude to read`);
+      continue;
+    }
+    total += bytes.length;
+    if (IMG.includes(type)) blocks.push({ type: "image", source: { type: "base64", media_type: type, data: b64(bytes) } });
+    else if (type === "application/pdf") blocks.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64(bytes) }, title: String(label).slice(0, 100) });
+    else blocks.push({ type: "text", text: `Attached file ${label}:
+` + new TextDecoder().decode(bytes).slice(0, 2e4) });
+    notes.push(`${label}: attached above (file ${blocks.length})`);
+  }
+  return { blocks, notes };
+}
+async function checkKpi(b) {
+  const { blocks, notes } = await proofBlocks(b.storage, b.files);
+  const prompt = `You check ONE weekly KPI result that a Head of Department (HOD) at Atlas Maharani Group (textile retail, Kerala, 24 showrooms) has just entered. It will be presented to the MD office on Monday. The MD wants RESULT-ORIENTED reporting, not "work done".
 
-How to judge each row:
-- Result-oriented: a measured outcome against the target (a number, %, or "X out of Y"), backed by verifiable supporting data (count, source report, list).
-- Activity only: says work was "done", "checked", "followed up", "ongoing", or claims 100% / Green without saying what was measured or how.
-- Every Amber or Red row needs a root cause ("reason") and a "nextStep" (what, who, by when). A vague next step ("will improve", "will follow up") is not enough \u2014 ask for the concrete action.
-- Status is calculated automatically from the achievement %, so never question the colour itself; question the figure or the evidence behind it.
-- "attached" lists voice notes / photos / files the HOD attached as evidence. You cannot open them: count them as supporting evidence that exists, do not ask for proof that is already attached, but still ask what they show if the written reason is empty.
-- Flag inconsistencies: 100% or Green with no data or evidence, figures that cannot be right for the target, headline KPIs left blank.
-- Next week's priorities should each name an expected number.
-- If the HOD already answered a question well (see earlier answers), do not ask it again.
-Never invent figures.
+KPI and the HOD's entry: ${JSON.stringify(b.kpi)}
+Department: ${str(b.deptName, 80)} (HOD: ${str(b.hod, 120)}) \xB7 Week: ${str(b.week, 40)}
+Attachments (proof): ${JSON.stringify(notes)}
+Earlier questions on this KPI and the HOD's answers: ${JSON.stringify((b.earlier || []).slice(0, 10))}
 
-LANGUAGE: Write "summary", every "issue", every "question" and every "suggestion" in simple, polite, everyday MALAYALAM (Malayalam script), the way a Kerala manager talks to a colleague. Keep KPI numbers, figures and common business terms (ATV, UPT, GP, PO, GRN, KPI, report names) in English inside the Malayalam sentence. Each question must be short enough to answer in one WhatsApp message. The "rating" value must stay exactly one of the three English labels.
+What to do:
+1. The status (Green/Amber/Red) is calculated from the achievement % and cannot be changed, so never question the colour; question the figure and the evidence.
+2. READ every attached photo / PDF / file. Find the number in it that this KPI is about (a count, a total, a %, an amount). Put that number in proof.count, and set proof.matches = true if it supports the HOD's answer (allow small rounding), false if it does not, null if the proof does not show that number. Say in proof.note, in one Malayalam sentence, what the proof shows. If nothing could be read, proof.read = false.
+3. Amber/Red needs a real root cause and a concrete next step (what, who, by when). "Will improve" / "will follow up" is not enough.
+4. Ask at most 3 short questions, only where something is unclear, unsupported, or does not match. Mark a question "high" only when the result cannot be accepted without the answer (e.g. proof contradicts the figure, Red with no real cause, 100% with no proof). If everything is clear, ask nothing.
+5. Do not repeat a question the HOD already answered well.
+verdict: "ok" = clear and supported, "doubt" = something to clarify, "weak" = activity-only / unsupported / proof contradicts.
 
-Department: ${str(b.deptName, 80)} (HOD: ${str(b.hod, 120)})
-Week: ${str(b.week, 40)} (meeting ${str(b.meeting, 40)})
-Reported rows: ${JSON.stringify((b.rows || []).slice(0, 80))}
-Headline weekly KPIs NOT reported: ${JSON.stringify(strArr(b.missing, 40))}
-Next week's priorities: ${JSON.stringify(strArr(b.priorities, 5))}
-Support needed: ${JSON.stringify(str(b.support, 1500))}
-Earlier answers from the HOD: ${JSON.stringify((b.clarifications || []).slice(0, 40))}
+LANGUAGE: "summary", "proof.note" and every question in simple, polite MALAYALAM (Malayalam script). Keep numbers and business terms (ATV, UPT, GP, PO, GRN, KPI, report names) in English inside the sentence. Each question must be answerable in one WhatsApp message.
 
 Reply with only this JSON:
-{"rating":"Result-oriented" | "Partly result-oriented" | "Activity only","score":<0-100, how result-oriented and evidence-backed the sheet is>,"summary":"<2 short sentences in Malayalam>","flags":[{"kpiNo":"<KPI number or empty>","severity":"high"|"medium"|"low","issue":"<in Malayalam, under 15 words>","question":"<one direct question in Malayalam>"}],"suggestions":["<one specific improvement in Malayalam>"]}
-At most ${maxFlags} flags, high severity first. At most 4 suggestions.`;
-  const res = await askClaudeJson(prompt, { model: Deno.env.get("CLAUDE_MODEL_CHECK") ?? "claude-sonnet-5-5", maxTokens: 4e3 });
+{"verdict":"ok"|"doubt"|"weak","summary":"<1-2 short sentences in Malayalam>","proof":{"read":true|false,"count":<number or null>,"matches":true|false|null,"note":"<Malayalam>"},"questions":[{"q":"<Malayalam question>","severity":"high"|"medium"|"low"}]}`;
+  const res = await askClaudeJson(prompt, { model: Deno.env.get("CLAUDE_MODEL_CHECK") ?? "claude-sonnet-5-5", maxTokens: 2e3 }, blocks);
   const sev = (s) => ["high", "medium", "low"].includes(String(s)) ? String(s) : "medium";
-  const score = Number(res.score);
   const order = { high: 0, medium: 1, low: 2 };
+  const pr = res.proof && typeof res.proof === "object" ? res.proof : null;
+  const cnt = pr ? Number(pr.count) : NaN;
   return {
-    rating: Object.keys(RATINGS_MAP).includes(res.rating) ? res.rating : "Partly result-oriented",
-    score: Number.isFinite(score) ? Math.max(0, Math.min(100, Math.round(score))) : null,
-    summary: str(res.summary, 800),
-    flags: (Array.isArray(res.flags) ? res.flags : []).slice(0, maxFlags).map((x) => ({ kpiNo: str(x.kpiNo, 20), severity: sev(x.severity), issue: str(x.issue, 300), question: str(x.question, 600) })).filter((x) => x.question).sort((a, b2) => order[a.severity] - order[b2.severity]),
-    suggestions: strArr(res.suggestions, 4)
+    verdict: ["ok", "doubt", "weak"].includes(res.verdict) ? res.verdict : "doubt",
+    summary: str(res.summary, 600),
+    proof: (b.files || []).length ? { read: !!(pr && pr.read), count: pr && pr.count != null && Number.isFinite(cnt) ? cnt : null, matches: pr && typeof pr.matches === "boolean" ? pr.matches : null, note: str(pr && pr.note, 400) } : null,
+    questions: (Array.isArray(res.questions) ? res.questions : []).slice(0, 3).map((x) => ({ q: str(x.q ?? x.question, 500), severity: sev(x.severity), answer: "" })).filter((x) => x.q).sort((a, c) => order[a.severity] - order[c.severity])
   };
 }
 var RATINGS_MAP = Object.fromEntries(RATINGS.map((r) => [r, true]));
@@ -343,7 +430,10 @@ For each department judge:
 - Did the HOD answer Claude's clarification questions properly, or dodge them? (Answers may be in Malayalam.)
 - Trend vs last week's score, overdue actions, KPIs Red two weeks running.
 - A department with a missing sheet should be called out.
-Questions for Monday must be direct and specific to a KPI or figure. Suggestions must be practical for a textile retail chain. Simple English. Never invent figures not in the data.
+- Each KPI row may carry "claude": what Claude found when the HOD finished that KPI (verdict ok/doubt/weak, and "proof" = what Claude read in the attached photo/PDF, with "matches" true/false against the HOD's figure). A proof that does not match the figure is a serious point for the MD.
+Questions for Monday must be direct and specific to a KPI or figure. Suggestions must be practical for a textile retail chain. Never invent figures not in the data.
+
+LANGUAGE: Write "headline", "groupView", every "watchList" item, every "verdict", every "question", every "suggestion" and every "crossDept" item in simple, clear MALAYALAM (Malayalam script), the way the MD office talks to its managers. Keep numbers, KPI numbers, department names and business terms (ATV, UPT, GP, PO, GRN, KPI) in English inside the Malayalam sentence. "rating" stays exactly one of the three English labels, and "dept" stays the id from the data.
 
 Week: ${str(b.weekLabel, 40)} (meeting ${str(b.meeting, 40)})
 Red two weeks running: ${JSON.stringify(strArr(b.repeatReds, 60))}
@@ -373,202 +463,313 @@ import PptxGenJS from "npm:pptxgenjs@4.0.1";
 
 // supabase/functions/_shared/ppt-builder.js
 var INK = "12343B";
-var GOLD = "B8892B";
+var GOLD = "C9962E";
 var MUT = "5A6B6F";
-var LINE = "D3DBD8";
+var LINE = "D9E1DE";
 var TXT = "13262B";
-var RED = "B23434";
-var RC = { G: ["DDF0E4", "25734A"], A: ["F8E9CC", "9A6412"], R: ["F7DEDC", "B23434"], NA: ["E4E9E8", "6B7779"], none: ["E4E9E8", "6B7779"], "": ["FFFFFF", "5A6B6F"] };
+var WHITE = "FFFFFF";
+var ST = { G: { bg: "E3F5EA", fg: "1E7A48", solid: "2EAD5B" }, A: { bg: "FFF1D6", fg: "9A6412", solid: "F2A93B" }, R: { bg: "FBE3E1", fg: "B23434", solid: "E05A4F" }, "": { bg: "EEF2F1", fg: "5A6B6F", solid: "9AA7A9" } };
+var ACCENTS = ["E4572E", "1B9AAA", "F2A93B", "6A4C93", "2E86AB", "D1495B", "3BB273", "EDAE49", "00798C", "8E5572"];
 var FONT = "Calibri";
-function whyCell(x) {
-  const parts = [];
-  if (x.reason) parts.push(x.reason);
-  if (x.next) parts.push("Next: " + x.next);
-  if (x.data) parts.push(x.data);
-  const f = filesSummary(x);
-  if (f) parts.push("\u{1F4CE} " + f);
-  return parts.join(" \xB7 ");
-}
+var FONT_ML = "Nirmala UI";
+var VERD = { ok: ["\u2713 Clear", "G"], doubt: ["? Needs clarity", "A"], weak: ["\u2717 Weak / not proved", "R"], skipped: ["Not checked", ""] };
+var clean = (s, n = 400) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
 function buildDeck(PptxGenJS2, d) {
   const { week, depts, results, actions, review: review2, today } = d;
+  const proofs = d.proofs || {}, links = d.links || {}, single = !!d.single, scope = d.scope || "weekly";
   const pptx = new PptxGenJS2();
   pptx.layout = "LAYOUT_WIDE";
   pptx.title = "HOD Review " + week;
+  const ds = deptListOf(depts);
+  const accent = (id) => ACCENTS[Math.max(0, ds.findIndex((x) => x.id === id)) % ACCENTS.length];
   pptx.defineSlideMaster({
     title: "M",
-    background: { color: "FFFFFF" },
+    background: { color: "FAFBFA" },
     objects: [
-      { rect: { x: 0, y: 7.18, w: 13.33, h: 0.04, fill: { color: GOLD } } },
-      { rect: { x: 0, y: 7.26, w: 13.33, h: 0.04, fill: { color: GOLD } } },
-      { text: { text: "Atlas Maharani Group \xB7 Weekly HOD Review \xB7 " + fmt(week), options: { x: 0.5, y: 6.8, w: 9, h: 0.3, fontSize: 9, color: MUT, fontFace: FONT } } }
+      { rect: { x: 0, y: 7.2, w: 13.33, h: 0.3, fill: { color: INK } } },
+      { text: { text: "Atlas Maharani Group \xB7 Weekly HOD Review \xB7 " + fmt(week), options: { x: 0.5, y: 7.2, w: 9, h: 0.3, fontSize: 9, color: "C9D6D3", fontFace: FONT } } }
     ],
-    slideNumber: { x: 12.4, y: 6.8, w: 0.5, h: 0.3, fontSize: 9, color: MUT }
+    slideNumber: { x: 12.4, y: 7.2, w: 0.6, h: 0.3, fontSize: 9, color: "C9D6D3" }
   });
-  const head = (s, title, sub) => {
-    s.addText(title, { x: 0.5, y: 0.3, w: 12.3, h: 0.6, fontSize: 26, bold: true, color: INK, fontFace: FONT });
-    if (sub) s.addText(sub, { x: 0.5, y: 0.9, w: 12.3, h: 0.4, fontSize: 13, color: MUT, fontFace: FONT });
+  const slide = (title, sub, color = INK) => {
+    const s = pptx.addSlide({ masterName: "M" });
+    s.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 13.33, h: 1.15, fill: { color } });
+    s.addShape(pptx.ShapeType.rect, { x: 0, y: 1.15, w: 13.33, h: 0.07, fill: { color: GOLD } });
+    s.addText(title, { x: 0.5, y: 0.12, w: 12.3, h: 0.6, fontSize: 26, bold: true, color: WHITE, fontFace: FONT });
+    if (sub) s.addText(sub, { x: 0.5, y: 0.66, w: 12.3, h: 0.4, fontSize: 13, color: "EAF2F0", fontFace: FONT });
+    return s;
   };
-  const H = (t2) => ({ text: t2, options: { bold: true, color: "FFFFFF", fill: { color: INK }, fontSize: 11 } });
-  const ragCell = (rag) => ({ text: RAGN[rag] || "\u2014", options: { bold: true, fill: { color: RC[rag || ""][0] }, color: RC[rag || ""][1], align: "center" } });
-  const ratingCell = (rating) => {
-    const k = RATINGS2[rating] || "";
-    return { text: rating || "\u2014", options: { bold: true, fill: { color: RC[k][0] }, color: RC[k][1] } };
+  const pill = (s, text, x, y, w, rag) => {
+    const c = ST[rag || ""] || ST[""];
+    s.addShape(pptx.ShapeType.roundRect, { x, y, w, h: 0.34, fill: { color: c.solid }, rectRadius: 0.17, line: { color: c.solid } });
+    s.addText(text, { x, y, w, h: 0.34, fontSize: 11, bold: true, color: WHITE, align: "center", valign: "middle", fontFace: FONT });
   };
-  const tblOpts = (colW) => ({ x: 0.5, y: 1.45, w: 12.33, colW, fontSize: 10, fontFace: FONT, color: TXT, border: { type: "solid", pt: 0.5, color: LINE }, valign: "middle", margin: 0.05 });
-  const bullets = (s, lines) => {
-    if (lines.length) s.addText(lines, { x: 0.5, y: 1.45, w: 12.3, h: 5.2, valign: "top", fontFace: FONT, color: TXT, fit: "shrink" });
+  const H = (t2, color = INK) => ({ text: t2, options: { bold: true, color: WHITE, fill: { color }, fontSize: 11 } });
+  const tbl = (s, rows, colW, y = 1.45, fontSize = 10) => s.addTable(rows, { x: 0.5, y, w: 12.33, colW, fontSize, fontFace: FONT, color: TXT, border: { type: "solid", pt: 0.5, color: LINE }, valign: "middle", margin: 0.06, autoPage: false });
+  const ragCell = (rag) => {
+    const c = ST[rag || ""];
+    return { text: rag ? "\u25CF " + RAGN[rag] : "\u2014", options: { bold: true, fill: { color: c.bg }, color: c.fg, align: "center" } };
   };
-  const sec = (t2, color, first) => ({ text: t2, options: { bold: true, fontSize: 16, color: color || INK, breakLine: true, paraSpaceBefore: first ? 0 : 10 } });
-  const bl = (t2, size) => ({ text: String(t2), options: { bullet: true, fontSize: size || 14, breakLine: true } });
+  const ml = (t2, o = {}) => ({ text: clean(t2, 700), options: { fontFace: FONT_ML, fontSize: 13, breakLine: true, ...o } });
+  const sec = (t2, color = INK) => ({ text: t2, options: { bold: true, fontSize: 15, color, breakLine: true, paraSpaceBefore: 8, fontFace: FONT } });
+  const bl = (t2, o = {}) => ({ text: clean(t2, 600), options: { bullet: { code: "25CF" }, fontSize: 13, breakLine: true, fontFace: FONT_ML, ...o } });
   const t = pptx.addSlide();
   t.background = { color: INK };
-  t.addShape(pptx.ShapeType.rect, { x: 0, y: 5.2, w: 13.33, h: 0.06, fill: { color: GOLD } });
-  t.addShape(pptx.ShapeType.rect, { x: 0, y: 5.32, w: 13.33, h: 0.06, fill: { color: GOLD } });
-  t.addText("ATLAS MAHARANI GROUP", { x: 0.8, y: 1.4, w: 11, h: 0.4, fontSize: 14, color: "D9AE55", bold: true, charSpacing: 4, fontFace: FONT });
-  t.addText("Weekly HOD Review", { x: 0.8, y: 1.9, w: 11, h: 1, fontSize: 44, color: "FFFFFF", bold: true, fontFace: FONT });
-  t.addText(`KRA & KPI results \xB7 week ${weekRange(week)}`, { x: 0.8, y: 3, w: 11, h: 0.5, fontSize: 20, color: "E4ECEA", fontFace: FONT });
-  t.addText(`Meeting: Monday ${fmt(week)}`, { x: 0.8, y: 3.6, w: 11, h: 0.4, fontSize: 16, color: "93A5A8", fontFace: FONT });
-  const ds = deptListOf(depts);
-  const snap = pptx.addSlide({ masterName: "M" });
-  const scores = [];
-  const tot = { G: 0, A: 0, R: 0 };
-  const srows = [[H("Department"), H("HOD"), H("Submitted"), H("Score"), H("Status"), H("Green"), H("Amber"), H("Red"), H("Open actions")]];
-  ds.forEach((dp) => {
+  ACCENTS.slice(0, 6).forEach((c, i) => t.addShape(pptx.ShapeType.rect, { x: 8.6 + i * 0.78, y: 0, w: 0.78, h: 7.5, fill: { color: c, transparency: 10 + i * 6 } }));
+  t.addShape(pptx.ShapeType.rect, { x: 0.8, y: 4.35, w: 3.2, h: 0.08, fill: { color: GOLD } });
+  t.addText("ATLAS MAHARANI GROUP", { x: 0.8, y: 1.3, w: 7.6, h: 0.4, fontSize: 14, color: "F2C66D", bold: true, charSpacing: 4, fontFace: FONT });
+  t.addText(single && ds[0] ? ds[0].name : "Weekly HOD Review", { x: 0.8, y: 1.8, w: 7.6, h: 1.3, fontSize: 46, color: WHITE, bold: true, fontFace: FONT, fit: "shrink" });
+  t.addText(`${single ? "KPI results" : "KRA & KPI results"} \xB7 week ${weekRange(week)}`, { x: 0.8, y: 3.15, w: 7.6, h: 0.5, fontSize: 20, color: "E4ECEA", fontFace: FONT });
+  t.addText(`Monday meeting ${fmt(week)}${single && ds[0] && ds[0].hod ? " \xB7 HOD " + ds[0].hod : ""}`, { x: 0.8, y: 3.7, w: 7.6, h: 0.4, fontSize: 15, color: "A9BCBF", fontFace: FONT });
+  const info = ds.map((dp) => {
     const r = results[dp.id];
-    const subm = r && r.status === "submitted";
     const sm = r ? summarize(r.rows) : { score: null, counts: { G: 0, A: 0, R: 0 }, rag: "none" };
-    if (subm) {
-      if (sm.score != null) scores.push(sm.score);
-      for (const k in tot) tot[k] += sm.counts[k];
-    }
-    srows.push([
-      { text: dp.name, options: { bold: true } },
-      dp.hod || "",
-      subm ? "Yes" : r ? "Draft" : "No",
-      sm.score != null ? sm.score + "%" : "\u2014",
-      ragCell(subm ? sm.rag : "none"),
-      String(sm.counts.G),
-      String(sm.counts.A),
-      String(sm.counts.R),
-      String(actions.filter((a) => a.dept === dp.id && a.status !== "Done").length)
-    ]);
+    const pg = progressOf(dp, r ? r.rows : {}, scope);
+    return { dp, r, sm, pg };
   });
-  const grp = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
-  head(snap, "Group snapshot", `${scores.length} of ${ds.length} departments submitted \xB7 group score ${grp != null ? grp + "%" : "\u2014"} \xB7 ${tot.G} Green, ${tot.A} Amber, ${tot.R} Red KPIs`);
-  snap.addTable(srows, tblOpts([2.3, 2.6, 1.1, 0.9, 1.2, 0.9, 0.9, 0.9, 1.53]));
-  if (review2) {
-    const s = pptx.addSlide({ masterName: "M" });
-    head(s, "MD office review (by Claude)", review2.headline || "");
+  if (!single) {
+    const tot = { G: 0, A: 0, R: 0 };
+    const scores = [];
+    info.forEach((x) => {
+      for (const k in tot) tot[k] += x.sm.counts[k];
+      if (x.sm.score != null) scores.push(x.sm.score);
+    });
+    const grp = scores.length ? Math.round(scores.reduce((a, b2) => a + b2, 0) / scores.length) : null;
+    const doneN = info.filter((x) => x.pg.complete).length;
+    const s = slide("Group snapshot", `${doneN} of ${ds.length} HODs finished \xB7 group score ${grp != null ? grp + "%" : "\u2014"} \xB7 ${tot.G} Green \xB7 ${tot.A} Amber \xB7 ${tot.R} Red`);
+    const labels = info.map((x) => x.dp.name);
+    const by = (k) => info.map((x) => x.sm.score != null && x.sm.rag === k ? x.sm.score : 0);
+    s.addText("Department score (% of target)", { x: 0.5, y: 1.4, w: 7.4, h: 0.35, fontSize: 14, bold: true, color: INK, fontFace: FONT });
+    s.addChart(
+      pptx.ChartType.bar,
+      [{ name: "Green", labels, values: by("G") }, { name: "Amber", labels, values: by("A") }, { name: "Red", labels, values: by("R") }],
+      {
+        x: 0.4,
+        y: 1.75,
+        w: 7.6,
+        h: 5.25,
+        barDir: "bar",
+        barGrouping: "stacked",
+        chartColors: [ST.G.solid, ST.A.solid, ST.R.solid],
+        valAxisMaxVal: 120,
+        valAxisMinVal: 0,
+        showValue: true,
+        dataLabelFormatCode: "0;;;",
+        dataLabelColor: WHITE,
+        dataLabelFontBold: true,
+        showLegend: false,
+        catAxisLabelFontSize: 11,
+        valAxisLabelFontSize: 9,
+        catAxisOrientation: "maxMin"
+      }
+    );
+    s.addText("All KPIs this week", { x: 8.3, y: 1.4, w: 4.5, h: 0.35, fontSize: 14, bold: true, color: INK, fontFace: FONT });
+    s.addChart(
+      pptx.ChartType.doughnut,
+      [{ name: "KPIs", labels: ["Green", "Amber", "Red"], values: [tot.G, tot.A, tot.R] }],
+      { x: 8.3, y: 1.75, w: 4.5, h: 3.6, holeSize: 58, chartColors: [ST.G.solid, ST.A.solid, ST.R.solid], showPercent: true, showLegend: true, legendPos: "b", dataLabelColor: WHITE, dataLabelFontBold: true }
+    );
+    s.addShape(pptx.ShapeType.roundRect, { x: 8.3, y: 5.5, w: 2.15, h: 1.4, fill: { color: INK }, rectRadius: 0.12 });
+    s.addText([{ text: grp != null ? grp + "%" : "\u2014", options: { fontSize: 30, bold: true, color: "F2C66D", breakLine: true } }, { text: "group score", options: { fontSize: 11, color: WHITE } }], { x: 8.3, y: 5.5, w: 2.15, h: 1.4, align: "center", valign: "middle", fontFace: FONT });
+    s.addShape(pptx.ShapeType.roundRect, { x: 10.65, y: 5.5, w: 2.15, h: 1.4, fill: { color: doneN === ds.length ? ST.G.solid : ST.A.solid }, rectRadius: 0.12 });
+    s.addText([{ text: `${doneN}/${ds.length}`, options: { fontSize: 30, bold: true, color: WHITE, breakLine: true } }, { text: "HODs done", options: { fontSize: 11, color: WHITE } }], { x: 10.65, y: 5.5, w: 2.15, h: 1.4, align: "center", valign: "middle", fontFace: FONT });
+    const b = slide("Department scoreboard", "Score, KPIs finished, and Claude's view of the proof \u2014 tap through the next slides for each department");
+    const cols = 4, tw = 2.95, th = 2.65;
+    info.forEach((x, i) => {
+      const cx = 0.5 + i % cols * (tw + 0.18), cy = 1.45 + Math.floor(i / cols) * (th + 0.18);
+      if (cy > 6.5) return;
+      const ac = accent(x.dp.id);
+      b.addShape(pptx.ShapeType.roundRect, { x: cx, y: cy, w: tw, h: th, fill: { color: WHITE }, line: { color: LINE }, rectRadius: 0.1, shadow: { type: "outer", blur: 4, offset: 1.5, angle: 90, color: "000000", opacity: 0.12 } });
+      b.addShape(pptx.ShapeType.rect, { x: cx, y: cy, w: tw, h: 0.55, fill: { color: ac } });
+      b.addText(x.dp.name, { x: cx + 0.12, y: cy, w: tw - 0.24, h: 0.55, fontSize: 14, bold: true, color: WHITE, valign: "middle", fontFace: FONT, fit: "shrink" });
+      b.addText(x.sm.score != null ? x.sm.score + "%" : "\u2014", { x: cx + 0.12, y: cy + 0.6, w: 1.6, h: 0.75, fontSize: 30, bold: true, color: (ST[x.sm.rag] || ST[""]).fg, fontFace: FONT });
+      b.addText(`${x.pg.done}/${x.pg.total}
+KPIs done`, { x: cx + 1.6, y: cy + 0.65, w: tw - 1.72, h: 0.7, fontSize: 11, color: MUT, align: "right", fontFace: FONT });
+      const c = x.sm.counts;
+      pill(b, `${c.G} G`, cx + 0.12, cy + 1.45, 0.85, "G");
+      pill(b, `${c.A} A`, cx + 1.05, cy + 1.45, 0.85, "A");
+      pill(b, `${c.R} R`, cx + 1.98, cy + 1.45, 0.85, "R");
+      const t2 = tally(x.r);
+      b.addText(`Claude: ${t2.ok} clear \xB7 ${t2.doubt} doubt \xB7 ${t2.weak} weak${t2.mismatch ? `
+\u{1F4CE} ${t2.mismatch} proof \u2260 figure` : ""}`, { x: cx + 0.12, y: cy + 1.88, w: tw - 0.24, h: 0.65, fontSize: 10, color: t2.mismatch ? ST.R.fg : MUT, fontFace: FONT, valign: "top" });
+    });
+  }
+  if (review2 && !single) {
+    const s = slide("MD office review \xB7 Claude", "", "6A4C93");
+    s.addText(clean(review2.headline, 300), { x: 0.5, y: 0.6, w: 12.3, h: 0.5, fontSize: 14, color: WHITE, fontFace: FONT_ML, fit: "shrink" });
     const lines = [];
-    if (review2.groupView) lines.push({ text: review2.groupView, options: { fontSize: 14, breakLine: true, paraSpaceAfter: 8 } });
+    if (review2.groupView) lines.push(ml(review2.groupView, { fontSize: 14, paraSpaceAfter: 6 }));
     if ((review2.watchList || []).length) {
-      lines.push(sec("Watch list this week", INK, true));
-      review2.watchList.forEach((x) => lines.push(bl(x, 13)));
+      lines.push(sec("\u0D08 \u0D06\u0D34\u0D4D\u0D1A \u0D36\u0D4D\u0D30\u0D26\u0D4D\u0D27\u0D3F\u0D15\u0D4D\u0D15\u0D47\u0D23\u0D4D\u0D1F\u0D35 \xB7 Watch list", "6A4C93"));
+      review2.watchList.forEach((x) => lines.push(bl(x)));
     }
     if ((review2.crossDept || []).length) {
-      lines.push(sec("Across departments"));
-      review2.crossDept.forEach((x) => lines.push(bl(x, 13)));
+      lines.push(sec("\u0D35\u0D15\u0D41\u0D2A\u0D4D\u0D2A\u0D41\u0D15\u0D7E \u0D24\u0D2E\u0D4D\u0D2E\u0D3F\u0D7D \xB7 Across departments", "6A4C93"));
+      review2.crossDept.forEach((x) => lines.push(bl(x)));
     }
-    bullets(s, lines);
-    const rr = [[H("Department"), H("Claude rating"), H("Verdict")]];
-    (review2.departments || []).forEach((x) => rr.push([(depts[x.dept] || {}).name || x.dept, ratingCell(x.rating), x.verdict]));
+    s.addText(lines, { x: 0.5, y: 1.4, w: 12.3, h: 5.6, valign: "top", color: TXT, fit: "shrink" });
+    const rr = [[H("Department", "6A4C93"), H("Claude rating", "6A4C93"), H("\u0D35\u0D3F\u0D32\u0D2F\u0D3F\u0D30\u0D41\u0D24\u0D4D\u0D24\u0D7D \xB7 verdict", "6A4C93")]];
+    (review2.departments || []).forEach((x) => {
+      const k = { "Result-oriented": "G", "Partly result-oriented": "A", "Activity only": "R" }[x.rating] || "";
+      rr.push([(depts[x.dept] || {}).name || x.dept, { text: x.rating || "\u2014", options: { bold: true, fill: { color: ST[k].bg }, color: ST[k].fg } }, { text: clean(x.verdict, 400), options: { fontFace: FONT_ML } }]);
+    });
     if (rr.length > 1) {
-      const s2 = pptx.addSlide({ masterName: "M" });
-      head(s2, "Result-oriented or just duty?", "Claude's rating of how each department reported this week");
-      s2.addTable(rr, tblOpts([2.2, 2.1, 8.03]));
+      const s2 = slide("Result-oriented or just duty?", "Claude's rating of how each department reported this week", "6A4C93");
+      tbl(s2, rr, [2.2, 2.2, 7.93], 1.45, 11);
     }
   }
-  const order = { R: 0, A: 1, G: 2, NA: 3, "": 4 };
-  ds.forEach((dp) => {
-    const r = results[dp.id];
-    const sm = r ? summarize(r.rows) : null;
-    if (!r) {
-      const s = pptx.addSlide({ masterName: "M" });
-      head(s, dp.name, `HOD ${dp.hod || ""}`);
-      s.addText("Results not submitted for this week.", { x: 0.5, y: 2.5, w: 12.3, h: 1, fontSize: 24, color: RED, bold: true, align: "center", fontFace: FONT });
-      return;
-    }
+  const order = { R: 0, A: 1, G: 2, "": 3 };
+  const empty = info.filter((x) => !x.r || !Object.keys(x.r.rows || {}).length);
+  if (empty.length) {
+    const s = slide(single ? ds[0].name : "Not reported yet", single ? "No KPI results this week" : `${empty.length} department${empty.length > 1 ? "s have" : " has"} not entered any KPI this week`, "B23434");
+    empty.forEach((x, i) => {
+      const cx = 0.5 + i % 2 * 6.25, cy = 1.5 + Math.floor(i / 2) * 1.05;
+      s.addShape(pptx.ShapeType.roundRect, { x: cx, y: cy, w: 6.05, h: 0.9, fill: { color: ST.R.bg }, line: { color: ST.R.bg }, rectRadius: 0.08 });
+      s.addShape(pptx.ShapeType.rect, { x: cx, y: cy, w: 0.14, h: 0.9, fill: { color: accent(x.dp.id) } });
+      s.addText([{ text: x.dp.name, options: { bold: true, fontSize: 16, color: TXT, breakLine: true } }, { text: `HOD ${x.dp.hod || "\u2014"} \xB7 0/${x.pg.total} KPIs`, options: { fontSize: 11, color: ST.R.fg } }], { x: cx + 0.3, y: cy, w: 5.6, h: 0.9, valign: "middle", fontFace: FONT });
+    });
+  }
+  info.forEach(({ dp, r, sm, pg }) => {
+    const ac = accent(dp.id);
+    if (!r || !Object.keys(r.rows || {}).length) return;
     const rows = Object.entries(r.rows || {}).map(([id, x]) => ({ id, ...x, rag: statusOf(x) })).sort((a, b) => order[a.rag] - order[b.rag] || (b.star ? 1 : 0) - (a.star ? 1 : 0) || String(a.no).localeCompare(String(b.no), void 0, { numeric: true }));
-    const per = 9;
-    const pages = Math.max(1, Math.ceil(rows.length / per));
-    for (let p = 0; p < pages; p++) {
-      const s = pptx.addSlide({ masterName: "M" });
-      head(
-        s,
-        `${dp.name} \u2014 ${sm.score != null ? sm.score + "%" : "\u2014"} ${sm.rag !== "none" ? "\xB7 " + RAGN[sm.rag] : ""}`,
-        `HOD ${dp.hod || ""} \xB7 ${sm.counts.G} Green, ${sm.counts.A} Amber, ${sm.counts.R} Red${r.status !== "submitted" ? " \xB7 DRAFT, not submitted" : ""}${r.source === "whatsapp" ? " \xB7 via WhatsApp" : ""}${pages > 1 ? ` \xB7 page ${p + 1} of ${pages}` : ""}`
-      );
-      const tr = [[H(""), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Status"), H("Reason \xB7 next step \xB7 evidence")]];
-      rows.slice(p * per, p * per + per).forEach((x) => tr.push([x.star ? { text: "\u2605", options: { color: GOLD, align: "center" } } : "", x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "\u2014", ragCell(x.rag), whyCell(x)]));
-      if (tr.length === 1) tr.push(["", "", "No KPI rows entered", "", "", "", "", ""]);
-      s.addTable(tr, tblOpts([0.35, 0.6, 4.1, 1.35, 1, 0.8, 0.95, 3.18]));
+    const sub = `HOD ${dp.hod || ""} \xB7 ${pg.done}/${pg.total} KPIs done${pg.complete ? " \u2713" : ""} \xB7 ${sm.counts.G} Green \xB7 ${sm.counts.A} Amber \xB7 ${sm.counts.R} Red${r.source === "whatsapp" ? " \xB7 via WhatsApp" : ""}`;
+    const per = 12;
+    for (let p = 0; p < Math.ceil(rows.length / per); p++) {
+      const s = slide(`${dp.name} \u2014 ${sm.score != null ? sm.score + "%" : "\u2014"}`, sub + (rows.length > per ? ` \xB7 ${p + 1}/${Math.ceil(rows.length / per)}` : ""), ac);
+      rows.slice(p * per, p * per + per).forEach((x, i) => {
+        const cx = 0.5 + i % 3 * 4.15, cy = 1.45 + Math.floor(i / 3) * 1.38;
+        const c = ST[x.rag || ""];
+        s.addShape(pptx.ShapeType.roundRect, { x: cx, y: cy, w: 4, h: 1.26, fill: { color: c.bg }, line: { color: c.bg }, rectRadius: 0.08 });
+        s.addShape(pptx.ShapeType.rect, { x: cx, y: cy, w: 0.12, h: 1.26, fill: { color: c.solid } });
+        s.addText(`${x.star ? "\u2605 " : ""}${x.no}  ${clean(x.text, 80)}`, { x: cx + 0.2, y: cy + 0.04, w: 3.75, h: 0.55, fontSize: 10.5, bold: true, color: TXT, fontFace: FONT, valign: "top", fit: "shrink" });
+        s.addText(
+          [{ text: x.ach != null ? x.ach + "%" : "\u2014", options: { fontSize: 22, bold: true, color: c.fg } }, { text: `   ${clean(x.actual, 20)} vs ${clean(x.target, 24)}`, options: { fontSize: 10, color: MUT } }],
+          { x: cx + 0.2, y: cy + 0.58, w: 3.75, h: 0.42, fontFace: FONT, valign: "middle" }
+        );
+        const v = x.ai ? VERD[x.ai.verdict] || VERD.doubt : null;
+        const nf = filesOf(x).length;
+        s.addText(`${v ? "Claude " + v[0] : "Not checked"}${x.ai && x.ai.proof && x.ai.proof.matches === false ? " \xB7 proof \u2260 figure" : ""}${nf ? `  \xB7  \u{1F4CE} ${nf}` : ""}`, { x: cx + 0.2, y: cy + 0.96, w: 3.75, h: 0.28, fontSize: 9, color: v ? ST[v[1]].fg : MUT, bold: !!(x.ai && x.ai.proof && x.ai.proof.matches === false), fontFace: FONT });
+      });
     }
-    const pri = (r.priorities || []).filter(Boolean);
-    const newActs = actions.filter((a) => a.dept === dp.id && a.week === week);
+    const why = rows.filter((x) => x.rag === "A" || x.rag === "R" || x.ai && x.ai.verdict !== "ok" && x.ai.verdict !== "skipped" || x.reason || x.data || x.next);
+    for (let p = 0; p < Math.ceil(why.length / 6); p++) {
+      const s = slide(`${dp.name} \u2014 reasons & next steps`, "Why it is below target, what happens next, and what Claude read in the proof", ac);
+      const tr = [[H("KPI", ac), H("Result", ac), H("Reason", ac), H("Next step", ac), H("Claude \xB7 proof", ac)]];
+      why.slice(p * 6, p * 6 + 6).forEach((x) => {
+        const pr = x.ai && x.ai.proof;
+        tr.push([
+          { text: `${x.no} ${clean(x.text, 70)}`, options: { bold: true } },
+          ragCellText(x),
+          { text: clean(x.reason || x.data, 220), options: { fontFace: FONT_ML } },
+          { text: clean(x.next, 200), options: { fontFace: FONT_ML } },
+          {
+            text: x.ai ? clean(`${(VERD[x.ai.verdict] || VERD.doubt)[0]}. ${pr ? (pr.count != null ? `Proof shows ${pr.count}${pr.matches === true ? " \u2713" : pr.matches === false ? " \u2717 does not match" : ""}. ` : "") + (pr.note || "") : x.ai.summary || ""}`, 260) : "Not checked",
+            options: { fontFace: FONT_ML, color: pr && pr.matches === false ? ST.R.fg : TXT }
+          }
+        ]);
+      });
+      tbl(s, tr, [2.9, 1.35, 2.85, 2.6, 2.63], 1.45, 10);
+    }
+    const files = rows.flatMap((x) => filesOf(x).map((f) => ({ ...f, kpi: x })));
+    const pics = files.filter((f) => proofs[f.path]);
+    for (let p = 0; p < Math.ceil(pics.length / 4); p++) {
+      const s = slide(`${dp.name} \u2014 proof`, "Photos the HOD attached, with what Claude read in them", ac);
+      pics.slice(p * 4, p * 4 + 4).forEach((f, i) => {
+        const cx = 0.5 + i % 2 * 6.25, cy = 1.4 + Math.floor(i / 2) * 2.9;
+        s.addShape(pptx.ShapeType.roundRect, { x: cx, y: cy, w: 6.05, h: 2.75, fill: { color: WHITE }, line: { color: LINE }, rectRadius: 0.06 });
+        s.addImage({ data: String(proofs[f.path]).replace(/^data:/, ""), x: cx + 0.1, y: cy + 0.1, w: 3.2, h: 2.55, sizing: { type: "contain", w: 3.2, h: 2.55 }, hyperlink: links[f.path] ? { url: links[f.path] } : void 0 });
+        const pr = f.kpi.ai && f.kpi.ai.proof;
+        s.addText(
+          [
+            { text: `KPI ${f.kpi.no}`, options: { bold: true, fontSize: 13, color: ac, breakLine: true } },
+            { text: clean(f.kpi.text, 90), options: { fontSize: 10, color: TXT, breakLine: true } },
+            { text: `Result: ${clean(f.kpi.actual, 20)} \u2192 ${f.kpi.ach != null ? f.kpi.ach + "%" : "\u2014"}`, options: { fontSize: 11, bold: true, color: (ST[statusOf(f.kpi)] || ST[""]).fg, breakLine: true } },
+            ...pr ? [
+              { text: pr.count != null ? `Claude counted ${pr.count}${pr.matches === true ? " \u2713 matches" : pr.matches === false ? " \u2717 does not match" : ""}` : "Claude read it", options: { fontSize: 11, bold: true, color: pr.matches === false ? ST.R.fg : ST.G.fg, breakLine: true } },
+              { text: clean(pr.note, 180), options: { fontSize: 10, color: MUT, fontFace: FONT_ML } }
+            ] : []
+          ],
+          { x: cx + 3.4, y: cy + 0.1, w: 2.55, h: 2.55, valign: "top", fontFace: FONT, fit: "shrink" }
+        );
+      });
+    }
+    const others = files.filter((f) => !proofs[f.path]);
+    if (others.length) {
+      const s = slide(`${dp.name} \u2014 attached files`, "Click a file to open it (links work for 7\u201330 days)", ac);
+      const lines = others.slice(0, 22).map((f) => {
+        const k = f.kind || kindOf(f.type);
+        const icon = k === "voice" ? "\u{1F3A4}" : k === "photo" ? "\u{1F4F7}" : "\u{1F4CE}";
+        return { text: `${icon}  KPI ${f.kpi.no} \xB7 ${f.name || "file"}${f.via === "whatsapp" ? " (WhatsApp)" : ""}`, options: { fontSize: 13, breakLine: true, color: links[f.path] ? "1B6FB3" : TXT, hyperlink: links[f.path] ? { url: links[f.path] } : void 0 } };
+      });
+      s.addText(lines, { x: 0.6, y: 1.45, w: 12.1, h: 5.5, valign: "top", fontFace: FONT, fit: "shrink" });
+    }
+    const qa = rows.flatMap((x) => (x.ai && x.ai.questions || []).map((q) => ({ no: x.no, q: q.q, a: q.answer })));
     const drv = review2 && (review2.departments || []).find((x) => x.dept === dp.id);
-    const ai = r.ai;
-    if (pri.length || r.support || newActs.length || drv || ai) {
-      const s = pptx.addSlide({ masterName: "M" });
-      head(s, `${dp.name} \u2014 plan & Claude's questions`, ai ? `Claude check: ${ai.rating}${ai.score != null ? " \xB7 evidence " + ai.score + "/100" : ""}` : "Not checked by Claude");
+    const pri = (r.priorities || []).filter(Boolean);
+    {
       const lines = [];
       if (drv && (drv.questions || []).length) {
-        lines.push(sec("Ask on Monday", RED, !lines.length));
+        lines.push(sec("\u0D24\u0D3F\u0D19\u0D4D\u0D15\u0D33\u0D3E\u0D34\u0D4D\u0D1A \u0D1A\u0D4B\u0D26\u0D3F\u0D15\u0D4D\u0D15\u0D47\u0D23\u0D4D\u0D1F\u0D24\u0D4D \xB7 Ask on Monday", ST.R.fg));
         drv.questions.forEach((x) => lines.push(bl(x)));
       }
-      const qa = ai && ai.flags || [];
-      const unans = qa.filter((x) => !(x.answer || "").trim());
-      const ans = [...r.clar || [], ...qa.filter((x) => (x.answer || "").trim())];
-      if (unans.length) {
-        lines.push(sec("Claude's questions not answered by HOD", RED, !lines.length));
-        unans.forEach((x) => lines.push(bl((x.kpiNo ? "KPI " + x.kpiNo + ": " : "") + x.question, 13)));
-      }
-      if (ans.length) {
-        lines.push(sec("HOD's answers to Claude", INK, !lines.length));
-        ans.slice(0, 6).forEach((x) => lines.push(bl(`${x.kpiNo ? "KPI " + x.kpiNo + ": " : ""}${x.question} \u2192 ${x.answer}`, 12)));
-      }
-      if (drv && (drv.suggestions || []).length) {
-        lines.push(sec("Suggestions", INK, !lines.length));
-        drv.suggestions.forEach((x) => lines.push(bl(x)));
+      if (qa.length) {
+        lines.push(sec("Claude-\u0D28\u0D4D\u0D31\u0D46 \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D19\u0D4D\u0D19\u0D7E, HOD-\u0D28\u0D4D\u0D31\u0D46 \u0D2E\u0D31\u0D41\u0D2A\u0D1F\u0D3F", ac));
+        qa.slice(0, 8).forEach((x) => {
+          lines.push(bl(`KPI ${x.no}: ${x.q}`, { bold: true, fontSize: 12 }));
+          lines.push({ text: "\u2192 " + (clean(x.a, 300) || "\u0D2E\u0D31\u0D41\u0D2A\u0D1F\u0D3F \u0D07\u0D32\u0D4D\u0D32 (not answered)"), options: { fontSize: 12, breakLine: true, indentLevel: 1, fontFace: FONT_ML, color: x.a ? TXT : ST.R.fg } });
+        });
       }
       if (pri.length) {
-        lines.push(sec("Top priorities", INK, !lines.length));
+        lines.push(sec("Next week's priorities", INK));
         pri.forEach((x) => lines.push(bl(x)));
       }
-      if (newActs.length) {
-        lines.push(sec("Actions for Red KPIs", INK, !lines.length));
-        newActs.forEach((a) => lines.push(bl(`${a.kpiNo ? "KPI " + a.kpiNo + ": " : ""}${a.action} \u2014 ${a.owner || "owner?"}, by ${a.due ? fmtShort(a.due) : "date?"}`)));
-      }
       if (r.support) {
-        lines.push(sec("Support needed", INK, !lines.length));
-        lines.push({ text: r.support, options: { fontSize: 14, breakLine: true } });
+        lines.push(sec("Support needed", INK));
+        lines.push(ml(r.support));
       }
-      bullets(s, lines);
+      const s = lines.length ? slide(`${dp.name} \u2014 Claude's questions & next week`, "", ac) : null;
+      if (s) s.addText(lines, { x: 0.5, y: 1.4, w: 12.3, h: 5.65, valign: "top", color: TXT, fit: "shrink" });
     }
   });
-  const reds = [];
-  ds.forEach((dp) => {
-    const r = results[dp.id];
-    if (!r) return;
-    Object.values(r.rows || {}).forEach((x) => {
-      if (statusOf(x) === "R") reds.push([dp.name, x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "\u2014", whyCell(x)]);
+  if (!single) {
+    const reds = [];
+    ds.forEach((dp) => {
+      const r = results[dp.id];
+      if (!r) return;
+      Object.values(r.rows || {}).forEach((x) => {
+        if (statusOf(x) === "R") reds.push([{ text: dp.name, options: { bold: true, color: accent(dp.id) } }, x.no, clean(x.text, 90), clean(x.actual, 20) + " / " + clean(x.target, 20), { text: x.ach != null ? x.ach + "%" : "\u2014", options: { bold: true, color: ST.R.fg } }, { text: clean(x.reason || x.data, 160), options: { fontFace: FONT_ML } }, { text: clean(x.next, 160), options: { fontFace: FONT_ML } }]);
+      });
     });
-  });
-  for (let p = 0; p < Math.max(1, Math.ceil(reds.length / 10)); p++) {
-    const s = pptx.addSlide({ masterName: "M" });
-    head(s, "Red KPIs across the group", reds.length ? `${reds.length} KPIs below 80% of target \u2014 each needs an owner, action and date` : "No Red KPIs reported this week");
-    if (reds.length) s.addTable([[H("Department"), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Reason \xB7 next step")], ...reds.slice(p * 10, p * 10 + 10)], tblOpts([1.8, 0.6, 4, 1.4, 1, 0.8, 2.73]));
+    for (let p = 0; p < Math.max(1, Math.ceil(reds.length / 8)); p++) {
+      const s = slide("Red KPIs across the group", reds.length ? `${reds.length} KPIs below 80% of target \u2014 each needs an owner, action and date` : "No Red KPIs this week \u{1F389}", "B23434");
+      if (reds.length) tbl(s, [[H("Department", "B23434"), H("#", "B23434"), H("KPI", "B23434"), H("Result / target", "B23434"), H("Ach", "B23434"), H("Reason", "B23434"), H("Next step", "B23434")], ...reds.slice(p * 8, p * 8 + 8)], [1.6, 0.55, 3.3, 1.5, 0.7, 2.4, 2.28]);
+    }
   }
-  const acts = actions.filter((a) => a.status !== "Done").sort((a, b) => (a.due || "9999").localeCompare(b.due || "9999"));
-  for (let p = 0; p < Math.max(1, Math.ceil(acts.length / 11)); p++) {
-    const s = pptx.addSlide({ masterName: "M" });
+  const acts = actions.filter((a) => a.status !== "Done" && (!single || depts[a.dept])).sort((a, b) => (a.due || "9999").localeCompare(b.due || "9999"));
+  for (let p = 0; p < Math.max(1, Math.ceil(acts.length / 10)); p++) {
     const od = acts.filter((a) => a.due && a.due < today).length;
-    head(s, "Pending points \u2014 action tracker", acts.length ? `${acts.length} open actions \xB7 ${od} overdue` : "No open actions");
-    if (acts.length) s.addTable([[H("Department"), H("KPI"), H("Action"), H("Owner"), H("Due"), H("Status")], ...acts.slice(p * 11, p * 11 + 11).map((a) => {
+    const s = slide("Pending points \u2014 action tracker", acts.length ? `${acts.length} open actions \xB7 ${od} overdue` : "No open actions", "00798C");
+    if (acts.length) tbl(s, [[H("Department", "00798C"), H("KPI", "00798C"), H("Action", "00798C"), H("Owner", "00798C"), H("Due", "00798C"), H("Status", "00798C")], ...acts.slice(p * 10, p * 10 + 10).map((a) => {
       const late = a.due && a.due < today;
-      return [(depts[a.dept] || {}).name || a.dept, a.kpiNo || "", a.action, a.owner || "", { text: a.due ? fmtShort(a.due) + (late ? " \xB7 overdue" : "") : "\u2014", options: late ? { color: RED, bold: true } : {} }, a.status];
-    })], tblOpts([1.8, 0.7, 5.3, 1.8, 1.4, 1.33]));
+      return [{ text: (depts[a.dept] || {}).name || a.dept, options: { bold: true, color: accent(a.dept) } }, a.kpiNo || "", { text: clean(a.action, 200), options: { fontFace: FONT_ML } }, a.owner || "", { text: a.due ? fmtShort(a.due) + (late ? " \xB7 overdue" : "") : "\u2014", options: late ? { color: ST.R.fg, bold: true } : {} }, a.status];
+    })], [1.8, 0.7, 5.3, 1.8, 1.4, 1.33]);
   }
   return pptx;
+  function ragCellText(x) {
+    const c = ST[x.rag || ""];
+    return { text: `${clean(x.actual, 18)}
+${x.ach != null ? x.ach + "%" : "\u2014"} ${x.rag ? RAGN[x.rag] : ""}`, options: { bold: true, fill: { color: c.bg }, color: c.fg, align: "center" } };
+  }
+}
+function tally(r) {
+  const t = { ok: 0, doubt: 0, weak: 0, mismatch: 0 };
+  Object.values(r && r.rows || {}).forEach((x) => {
+    if (!x.ai || !t.hasOwnProperty(x.ai.verdict)) return;
+    t[x.ai.verdict]++;
+    if (x.ai.proof && x.ai.proof.matches === false) t.mismatch++;
+  });
+  return t;
 }
 
 // supabase/functions/_shared/data.ts
@@ -606,6 +807,21 @@ async function getSettings(db) {
   const { data } = await db.from("app_settings").select("*").eq("id", 1).maybeSingle();
   return data || { report_numbers: [], bot_scope: "weekly", tpl_start: "kpi_weekly_start", tpl_report: "kpi_weekly_report", tpl_lang: "ml" };
 }
+async function progressAll(db, week, scope) {
+  const [{ data: dRows }, { data: kRows }, { data: res }] = await Promise.all([
+    db.from("departments").select("*").order("sort_order"),
+    db.from("kpis").select("*"),
+    db.from("results").select("dept_id, rows").eq("week", week)
+  ]);
+  const depts = buildDepts(dRows || [], kRows || []);
+  const out = {};
+  for (const d of dRows || []) {
+    const r = (res || []).find((x) => x.dept_id === d.id);
+    const pg = progressOf(depts[d.id], r ? r.rows : {}, scope);
+    out[d.id] = { name: d.name, done: pg.done, total: pg.total, pending: pg.total - pg.done };
+  }
+  return out;
+}
 async function review(db, week, userId = null) {
   const d = await loadWeek(db, week);
   const data = await reviewWeek({ weekLabel: weekRange(week), meeting: fmt(week), repeatReds: repeatReds(d.depts, d.results, d.prev).map((x) => `${x.name} ${x.no} ${x.text}`), departments: reviewDepartments(d) });
@@ -624,7 +840,8 @@ async function ppt(db, week, opts = {}) {
       console.error("review before ppt failed", e);
     }
   }
-  const deck = buildDeck(PptxGenJS, d);
+  const { proofs, links } = await proofFor(db, d.results);
+  const deck = buildDeck(PptxGenJS, { ...d, proofs, links, scope: (await getSettings(db)).bot_scope });
   const bytes = await deck.write({ outputType: "uint8array" });
   const filename = `HOD-Review-${week}.pptx`;
   const path = `${week}/${filename}`;
@@ -635,12 +852,15 @@ async function ppt(db, week, opts = {}) {
   const link = signed.data.signedUrl;
   const st = await getSettings(db);
   const to = (opts.to && opts.to.length ? opts.to : st.report_numbers) || [];
-  const total = deptListOf(d.depts).length;
-  const submitted = Object.values(d.results).filter((r) => r.status === "submitted").length;
+  const prog = await progressAll(db, week, st.bot_scope);
+  const list = Object.values(prog).filter((x) => x.total);
+  const doneNames = list.filter((x) => x.pending === 0).map((x) => x.name);
+  const notDone = list.filter((x) => x.pending > 0).map((x) => `${x.name} (${x.pending} \u0D2C\u0D3E\u0D15\u0D4D\u0D15\u0D3F)`);
+  const total = list.length, submitted = doneNames.length;
   const sent = [], failed = [];
   for (const n of to) {
     try {
-      await sendTemplate(db, n, st.tpl_report, st.tpl_lang, [weekRange(week), `${submitted}/${total}`], { link, filename });
+      await sendTemplate(db, n, st.tpl_report, st.tpl_lang, [weekRange(week), doneNames.join(", ") || "\u0D06\u0D30\u0D41\u0D2E\u0D3F\u0D32\u0D4D\u0D32", notDone.join(", ") || "\u0D07\u0D32\u0D4D\u0D32 \u2014 \u0D0E\u0D32\u0D4D\u0D32\u0D3E\u0D35\u0D30\u0D41\u0D02 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D15\u0D4D\u0D15\u0D3F \u2713"], { link, filename });
       sent.push(n);
     } catch (e) {
       failed.push(`${n}: ${e.message}`);
@@ -651,53 +871,83 @@ async function ppt(db, week, opts = {}) {
     "ppt",
     week,
     failed.length === 0 && (to.length === 0 || sent.length > 0),
-    `${submitted}/${total} submitted \xB7 sent to ${sent.length} number(s)${to.length === 0 ? " (no numbers in Settings)" : ""}${failed.length ? ` \xB7 failed: ${failed.join("; ")}` : ""}`
+    `${submitted}/${total} HODs done${notDone.length ? ` \xB7 not done: ${notDone.join(", ")}` : ""} \xB7 sent to ${sent.length} number(s)${to.length === 0 ? " (no numbers in Settings)" : ""}${failed.length ? ` \xB7 failed: ${failed.join("; ")}` : ""}`
   );
-  return { link, filename, sent, failed, submitted, total };
+  return { link, filename, sent, failed, submitted, total, done: doneNames, notDone };
+}
+async function proofFor(db, results) {
+  const proofs = {}, links = {};
+  const files = [];
+  Object.values(results || {}).forEach((r) => Object.values(r.rows || {}).forEach((x) => filesOf(x).forEach((f) => files.push(f))));
+  for (const f of files) {
+    try {
+      const { data } = await db.storage.from("evidence").createSignedUrl(f.path, 60 * 60 * 24 * 30);
+      if (data && data.signedUrl) links[f.path] = data.signedUrl;
+    } catch (_) {
+    }
+  }
+  let n = 0;
+  for (const f of files) {
+    if ((f.kind || kindOf(f.type)) !== "photo" || n >= 40) continue;
+    const type = String(f.type || "image/jpeg").split(";")[0];
+    if (!["image/jpeg", "image/png", "image/gif", "image/webp"].includes(type)) continue;
+    try {
+      const { data } = await db.storage.from("evidence").download(f.path);
+      if (!data) continue;
+      const bytes = new Uint8Array(await data.arrayBuffer());
+      if (bytes.length > 4e6) continue;
+      proofs[f.path] = `data:${type};base64,${b64(bytes)}`;
+      n++;
+    } catch (_) {
+    }
+  }
+  return { proofs, links };
 }
 
 // supabase/functions/_shared/bot.ts
 var WORDS = {
   start: ["start", "kpi", "report", "hi", "hello", "hai", "\u0D24\u0D41\u0D1F\u0D19\u0D4D\u0D19\u0D41\u0D15", "\u0D24\u0D41\u0D1F\u0D19\u0D4D\u0D19\u0D3E\u0D02", "\u0D39\u0D3E\u0D2F\u0D4D", "\u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D"],
-  restart: ["restart", "\u0D35\u0D40\u0D23\u0D4D\u0D1F\u0D41\u0D02", "\u0D35\u0D40\u0D23\u0D4D\u0D1F\u0D41\u0D02 \u0D24\u0D41\u0D1F\u0D19\u0D4D\u0D19\u0D41\u0D15"],
-  skip: ["skip", "\u0D12\u0D34\u0D3F\u0D35\u0D3E\u0D15\u0D4D\u0D15\u0D41\u0D15", "-", "next"],
+  menu: ["menu", "list", "pending", "\u0D32\u0D3F\u0D38\u0D4D\u0D31\u0D4D\u0D31\u0D4D", "\u0D2C\u0D3E\u0D15\u0D4D\u0D15\u0D3F"],
+  all: ["all", "restart", "edit", "\u0D0E\u0D32\u0D4D\u0D32\u0D3E\u0D02", "\u0D35\u0D40\u0D23\u0D4D\u0D1F\u0D41\u0D02"],
+  ok: ["ok", "okay", "yes", "go", "\u0D36\u0D30\u0D3F", "next"],
+  skip: ["skip", "\u0D12\u0D34\u0D3F\u0D35\u0D3E\u0D15\u0D4D\u0D15\u0D41\u0D15", "-", "later"],
   back: ["back", "\u0D2E\u0D41\u0D2E\u0D4D\u0D2A\u0D24\u0D4D\u0D24\u0D46", "\u0D2A\u0D3F\u0D28\u0D4D\u0D28\u0D4B\u0D1F\u0D4D\u0D1F\u0D4D"],
-  stop: ["stop", "pause", "\u0D28\u0D3F\u0D7C\u0D24\u0D4D\u0D24\u0D41\u0D15", "later"],
+  stop: ["stop", "pause", "\u0D28\u0D3F\u0D7C\u0D24\u0D4D\u0D24\u0D41\u0D15"],
   status: ["status", "\u0D28\u0D3F\u0D32"],
   help: ["help", "\u0D38\u0D39\u0D3E\u0D2F\u0D02", "?"],
   none: ["no", "nil", "none", "\u0D07\u0D32\u0D4D\u0D32", "\u0D35\u0D47\u0D23\u0D4D\u0D1F", "na", "n/a"]
 };
 var is = (t, k) => WORDS[k].includes(t);
-var RAG_WORDS = /* @__PURE__ */ new Set(["g", "green", "\u0D2A\u0D1A\u0D4D\u0D1A", "a", "amber", "\u0D2E\u0D1E\u0D4D\u0D1E", "r", "red", "\u0D1A\u0D41\u0D35\u0D2A\u0D4D\u0D2A\u0D4D"]);
-var HELP = "*\u0D38\u0D39\u0D3E\u0D2F\u0D02*\nSTART \u2013 \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D24\u0D41\u0D1F\u0D19\u0D4D\u0D19\u0D3E\u0D7B / \u0D24\u0D41\u0D1F\u0D30\u0D3E\u0D7B\nSKIP \u2013 \u0D08 \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D02 \u0D12\u0D34\u0D3F\u0D35\u0D3E\u0D15\u0D4D\u0D15\u0D3E\u0D7B\nBACK \u2013 \u0D2E\u0D41\u0D2E\u0D4D\u0D2A\u0D24\u0D4D\u0D24\u0D46 \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D02\nSTATUS \u2013 \u0D0E\u0D24\u0D4D\u0D30 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F\nSTOP \u2013 \u0D2A\u0D3F\u0D28\u0D4D\u0D28\u0D40\u0D1F\u0D4D \u0D24\u0D41\u0D1F\u0D30\u0D3E\u0D7B\nRESTART \u2013 \u0D06\u0D26\u0D4D\u0D2F\u0D02 \u0D2E\u0D41\u0D24\u0D7D \u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D3E\u0D7B";
-function parseAnswer(text, manual) {
+var RAG_WORDS = /* @__PURE__ */ new Set(["g", "green", "\u0D2A\u0D1A\u0D4D\u0D1A", "a", "amber", "\u0D2E\u0D1E\u0D4D\u0D1E", "r", "red", "\u0D1A\u0D41\u0D35\u0D2A\u0D4D\u0D2A\u0D4D", "yes", "no", "done", "ok"]);
+var HELP = "*\u0D38\u0D39\u0D3E\u0D2F\u0D02*\nMENU \u2013 \u0D2C\u0D3E\u0D15\u0D4D\u0D15\u0D3F\u0D2F\u0D41\u0D33\u0D4D\u0D33 KPI \u0D32\u0D3F\u0D38\u0D4D\u0D31\u0D4D\u0D31\u0D4D\n(\u0D28\u0D2E\u0D4D\u0D2A\u0D7C) \u2013 \u0D32\u0D3F\u0D38\u0D4D\u0D31\u0D4D\u0D31\u0D3F\u0D7D \u0D28\u0D3F\u0D28\u0D4D\u0D28\u0D4D \u0D12\u0D30\u0D41 KPI \u0D24\u0D3F\u0D30\u0D1E\u0D4D\u0D1E\u0D46\u0D1F\u0D41\u0D15\u0D4D\u0D15\u0D3E\u0D7B\nSKIP \u2013 \u0D08 KPI \u0D2A\u0D3F\u0D28\u0D4D\u0D28\u0D40\u0D1F\u0D4D\nBACK \u2013 \u0D2E\u0D41\u0D2E\u0D4D\u0D2A\u0D24\u0D4D\u0D24\u0D46 KPI\nSTATUS \u2013 \u0D0E\u0D24\u0D4D\u0D30 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F\nSTOP \u2013 \u0D28\u0D3F\u0D7C\u0D24\u0D4D\u0D24\u0D3E\u0D7B (\u0D2A\u0D3F\u0D28\u0D4D\u0D28\u0D40\u0D1F\u0D4D START)\nALL \u2013 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D35 \u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D3E\u0D7B\n\n\u0D24\u0D46\u0D33\u0D3F\u0D35\u0D3E\u0D2F\u0D3F \u0D2B\u0D4B\u0D1F\u0D4D\u0D1F\u0D4B / PDF / \u0D36\u0D2C\u0D4D\u0D26 \u0D38\u0D28\u0D4D\u0D26\u0D47\u0D36\u0D02 \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D3E\u0D02. Claude \u0D2B\u0D4B\u0D1F\u0D4D\u0D1F\u0D4B\u0D2F\u0D41\u0D02 PDF-\u0D09\u0D02 \u0D35\u0D3E\u0D2F\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D02.";
+function parseAnswer(text, item) {
   const t = text.trim();
   const first = t.split(/[\s,.:;\-]+/)[0].toLowerCase();
   if (RAG_WORDS.has(first)) return { kind: "colour" };
-  const m = t.replace(/rs\.?\s*/ig, "").match(/-?\d[\d,]*(\.\d+)?/);
-  if (!m) return { kind: "none" };
-  const value = m[0].replace(/,/g, "");
-  const note = t.replace(/rs\.?\s*/ig, "").replace(m[0], "").replace(/^[\s,.:;%\-]+/, "").trim();
-  return { kind: "number", value, note };
+  const r = resultFrom(item, t);
+  if (!r) return { kind: "none" };
+  const m = t.replace(/rs\.?\s*/ig, "").match(/(\d[\d,]*(?:\.\d+)?)\s*(?:\/|of|out of)\s*(\d[\d,]*(?:\.\d+)?)|-?\d[\d,]*(?:\.\d+)?/i);
+  const note = m ? t.replace(/rs\.?\s*/ig, "").replace(m[0], "").replace(/^[\s,.:;%\-]+/, "").trim() : "";
+  return { kind: "number", actual: r.actual, ach: r.ach, note };
 }
-function askKpi(item, i, n, row) {
-  let s = `*${i + 1}/${n} \xB7 KPI ${item.no}${item.star ? " \u2605" : ""}*
-${item.text}
-\u0D32\u0D15\u0D4D\u0D37\u0D4D\u0D2F\u0D02: ${item.target} (${FREQ_ML[item.freq] || item.freq})`;
-  if (hasValue(row)) s += `
-\u0D07\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E: ${row.actual || (row.ach != null ? row.ach + "%" : "")}${filesOf(row).length ? " \xB7 \u{1F4CE} " + filesOf(row).length : ""} \u2014 \u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D2E\u0D3F\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D SKIP`;
-  s += isManual(item) ? "\n\n\u0D0E\u0D24\u0D4D\u0D30 \u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F \u0D0E\u0D28\u0D4D\u0D28\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 92). \u0D15\u0D42\u0D1F\u0D46 \u0D21\u0D3E\u0D31\u0D4D\u0D31 \u0D0E\u0D34\u0D41\u0D24\u0D3E\u0D02. \u0D28\u0D3F\u0D31\u0D02 (Green/Amber/Red) \u0D24\u0D28\u0D3F\u0D2F\u0D46 \u0D35\u0D30\u0D41\u0D02." : "\n\n\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D2F\u0D25\u0D3E\u0D7C\u0D24\u0D4D\u0D25 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15. \u0D15\u0D42\u0D1F\u0D46 \u0D21\u0D3E\u0D31\u0D4D\u0D31 \u0D0E\u0D34\u0D41\u0D24\u0D3E\u0D02 (\u0D09\u0D26\u0D3E: 1420, billing report).";
-  s += "\n\u0D24\u0D46\u0D33\u0D3F\u0D35\u0D3E\u0D2F\u0D3F \u0D2B\u0D4B\u0D1F\u0D4D\u0D1F\u0D4B / \u0D36\u0D2C\u0D4D\u0D26 \u0D38\u0D28\u0D4D\u0D26\u0D47\u0D36\u0D02 / \u0D21\u0D4B\u0D15\u0D4D\u0D2F\u0D41\u0D2E\u0D46\u0D28\u0D4D\u0D31\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D3E\u0D02.";
-  return s;
-}
-var askFlag = (f, i, n) => `*Claude-\u0D28\u0D4D\u0D31\u0D46 \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D02 ${i + 1}/${n}*${f.kpiNo ? " \xB7 KPI " + f.kpiNo : ""}${f.severity === "high" ? " (\u0D2E\u0D31\u0D41\u0D2A\u0D1F\u0D3F \u0D28\u0D3F\u0D7C\u0D2C\u0D28\u0D4D\u0D27\u0D02)" : ""}
-${f.question}`;
 var ASK_REASON = (no, rag) => `KPI ${no}: ${RAG_ML[rag] || ""}
-*\u0D15\u0D3E\u0D30\u0D23\u0D02* \u0D0E\u0D28\u0D4D\u0D24\u0D3E\u0D23\u0D4D? \u0D1F\u0D48\u0D2A\u0D4D\u0D2A\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D2F\u0D41\u0D15, \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D36\u0D2C\u0D4D\u0D26 \u0D38\u0D28\u0D4D\u0D26\u0D47\u0D36\u0D02 / \u0D2B\u0D4B\u0D1F\u0D4D\u0D1F\u0D4B / \u0D21\u0D4B\u0D15\u0D4D\u0D2F\u0D41\u0D2E\u0D46\u0D28\u0D4D\u0D31\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`;
+*\u0D15\u0D3E\u0D30\u0D23\u0D02* \u0D0E\u0D28\u0D4D\u0D24\u0D3E\u0D23\u0D4D? \u0D1F\u0D48\u0D2A\u0D4D\u0D2A\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D2F\u0D41\u0D15, \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D2B\u0D4B\u0D1F\u0D4D\u0D1F\u0D4B / PDF / \u0D36\u0D2C\u0D4D\u0D26 \u0D38\u0D28\u0D4D\u0D26\u0D47\u0D36\u0D02 \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`;
 var ASK_NEXT = (no) => `KPI ${no}: *\u0D05\u0D1F\u0D41\u0D24\u0D4D\u0D24 \u0D28\u0D1F\u0D2A\u0D1F\u0D3F* \u0D0E\u0D28\u0D4D\u0D24\u0D3E\u0D23\u0D4D? (\u0D0E\u0D28\u0D4D\u0D24\u0D4D, \u0D06\u0D30\u0D4D, \u0D0E\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E)
 \u0D09\u0D26\u0D3E: Perumbavoor-\u0D7D 2 staff \u0D15\u0D42\u0D1F\u0D3F, Manager Rajesh, 25 Oct-\u0D28\u0D15\u0D02`;
-var ASK_PRI = "*\u0D05\u0D1F\u0D41\u0D24\u0D4D\u0D24 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 3 \u0D2A\u0D4D\u0D30\u0D27\u0D3E\u0D28 \u0D2E\u0D41\u0D7B\u0D17\u0D23\u0D28\u0D15\u0D7E*\n\u0D13\u0D30\u0D4B\u0D28\u0D4D\u0D28\u0D41\u0D02 \u0D2A\u0D4D\u0D30\u0D24\u0D40\u0D15\u0D4D\u0D37\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D28\u0D4D\u0D28 \u0D28\u0D2E\u0D4D\u0D2A\u0D31\u0D4B\u0D1F\u0D46, \u0D13\u0D30\u0D4B \u0D35\u0D30\u0D3F\u0D2F\u0D3F\u0D7D \u0D12\u0D28\u0D4D\u0D28\u0D4D.\n\u0D09\u0D26\u0D3E: Perumbavoor conversion 75% \u0D06\u0D15\u0D4D\u0D15\u0D41\u0D15";
-var ASK_SUP = "*\u0D38\u0D39\u0D3E\u0D2F\u0D02 \u0D35\u0D47\u0D23\u0D4B?*\nCEO-\u0D2F\u0D3F\u0D7D \u0D28\u0D3F\u0D28\u0D4D\u0D28\u0D4B \u0D2E\u0D31\u0D4D\u0D31\u0D4D \u0D35\u0D15\u0D41\u0D2A\u0D4D\u0D2A\u0D41\u0D15\u0D33\u0D3F\u0D7D \u0D28\u0D3F\u0D28\u0D4D\u0D28\u0D4B \u0D0E\u0D28\u0D4D\u0D24\u0D4D \u0D38\u0D39\u0D3E\u0D2F\u0D02 \u0D35\u0D47\u0D23\u0D02? \u0D07\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u2018\u0D07\u0D32\u0D4D\u0D32\u2019 \u0D0E\u0D28\u0D4D\u0D28\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.";
+var ASK_PRI = "*\u0D05\u0D1F\u0D41\u0D24\u0D4D\u0D24 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 3 \u0D2A\u0D4D\u0D30\u0D27\u0D3E\u0D28 \u0D2E\u0D41\u0D7B\u0D17\u0D23\u0D28\u0D15\u0D7E* (optional)\n\u0D13\u0D30\u0D4B\u0D28\u0D4D\u0D28\u0D41\u0D02 \u0D2A\u0D4D\u0D30\u0D24\u0D40\u0D15\u0D4D\u0D37\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D28\u0D4D\u0D28 \u0D28\u0D2E\u0D4D\u0D2A\u0D31\u0D4B\u0D1F\u0D46, \u0D13\u0D30\u0D4B \u0D35\u0D30\u0D3F\u0D2F\u0D3F\u0D7D \u0D12\u0D28\u0D4D\u0D28\u0D4D. \u0D35\u0D47\u0D23\u0D4D\u0D1F\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D SKIP.";
+var ASK_SUP = "*\u0D38\u0D39\u0D3E\u0D2F\u0D02 \u0D35\u0D47\u0D23\u0D4B?*\nCEO-\u0D2F\u0D3F\u0D7D \u0D28\u0D3F\u0D28\u0D4D\u0D28\u0D4B \u0D2E\u0D31\u0D4D\u0D31\u0D4D \u0D35\u0D15\u0D41\u0D2A\u0D4D\u0D2A\u0D41\u0D15\u0D33\u0D3F\u0D7D \u0D28\u0D3F\u0D28\u0D4D\u0D28\u0D4B \u0D0E\u0D28\u0D4D\u0D24\u0D4D \u0D38\u0D39\u0D3E\u0D2F\u0D02 \u0D35\u0D47\u0D23\u0D02? \u0D07\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u2018\u0D07\u0D32\u0D4D\u0D32\u2019.";
+function askKpi(item, n, total, row) {
+  let s = `*KPI ${item.no}${item.star ? " \u2605" : ""}* (${n}/${total})
+${item.text}
+\u0D32\u0D15\u0D4D\u0D37\u0D4D\u0D2F\u0D02: *${item.target}*`;
+  if (row && (row.actual || row.ach != null)) s += `
+\u0D07\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E: ${row.actual || ""}${row.ach != null ? " \u2192 " + row.ach + "%" : ""}${filesOf(row).length ? " \xB7 \u{1F4CE} " + filesOf(row).length : ""}`;
+  s += answerKind(item) === "pct" ? `
+
+${isManual(item) ? "\u0D0E\u0D24\u0D4D\u0D30 \u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F?" : "\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02?"} \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 92) \u2014 \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D0E\u0D23\u0D4D\u0D23\u0D02: 46/48` : "\n\n\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D (\u0D0E\u0D23\u0D4D\u0D23\u0D02 / \u0D24\u0D41\u0D15) \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 1420).";
+  s += "\n\u0D15\u0D42\u0D1F\u0D46 \u0D2B\u0D4B\u0D1F\u0D4D\u0D1F\u0D4B / PDF \u0D24\u0D46\u0D33\u0D3F\u0D35\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D3E\u0D02. \u0D28\u0D3F\u0D31\u0D02 \u0D24\u0D28\u0D3F\u0D2F\u0D46 \u0D35\u0D30\u0D41\u0D02 \u{1F512}";
+  return s;
+}
 async function handleMessage(db, profile, textIn, media = null) {
   const text = (textIn || "").trim();
   const cmd = text.toLowerCase();
@@ -711,57 +961,55 @@ async function handleMessage(db, profile, textIn, media = null) {
     }
     if (profile.role === "admin" && cmd === "status") {
       const week2 = meetingWeek(istToday());
-      const { data: depts } = await db.from("departments").select("id, name, sort_order").order("sort_order");
-      const { data: res2 } = await db.from("results").select("dept_id, status, score").eq("week", week2);
-      const lines = (depts || []).map((d) => {
+      const st2 = await getSettings(db);
+      const [{ data: dRows }, { data: kRows2 }, { data: res2 }] = await Promise.all([
+        db.from("departments").select("*").order("sort_order"),
+        db.from("kpis").select("*"),
+        db.from("results").select("*").eq("week", week2)
+      ]);
+      const depts = buildDepts(dRows || [], kRows2 || []);
+      const lines = (dRows || []).map((d) => {
         const r = (res2 || []).find((x) => x.dept_id === d.id);
-        return `${r && r.status === "submitted" ? "\u2713" : r ? "\u2026" : "\u2717"} ${d.name}${r && r.score != null ? " \xB7 " + r.score + "%" : ""}`;
+        const pg = progressOf(depts[d.id], r ? r.rows : {}, st2.bot_scope);
+        return `${pg.complete ? "\u2713" : pg.done ? "\u2026" : "\u2717"} ${d.name} \xB7 ${pg.done}/${pg.total}${r && r.score != null ? " \xB7 " + r.score + "%" : ""}`;
       });
-      await reply(`*${weekRange(week2)} \xB7 \u0D38\u0D2E\u0D7C\u0D2A\u0D4D\u0D2A\u0D23 \u0D28\u0D3F\u0D32*
+      await reply(`*${weekRange(week2)} \xB7 HOD \u0D28\u0D3F\u0D32*
 ${lines.join("\n")}`);
       return;
     }
-    await reply(profile.role === "admin" ? "Admin commands:\nPPT \u2013 \u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 PPT\nSTATUS \u2013 \u0D06\u0D30\u0D4A\u0D15\u0D4D\u0D15\u0D46 \u0D38\u0D2E\u0D7C\u0D2A\u0D4D\u0D2A\u0D3F\u0D1A\u0D4D\u0D1A\u0D41" : "KPI \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D HOD-\u0D2E\u0D3E\u0D7C\u0D15\u0D4D\u0D15\u0D4D \u0D2E\u0D3E\u0D24\u0D4D\u0D30\u0D2E\u0D3E\u0D23\u0D4D.");
+    await reply(profile.role === "admin" ? "Admin commands:\nPPT \u2013 \u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 PPT\nSTATUS \u2013 HOD-\u0D2E\u0D3E\u0D30\u0D41\u0D1F\u0D46 \u0D28\u0D3F\u0D32" : "KPI \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D HOD-\u0D2E\u0D3E\u0D7C\u0D15\u0D4D\u0D15\u0D4D \u0D2E\u0D3E\u0D24\u0D4D\u0D30\u0D2E\u0D3E\u0D23\u0D4D.");
     return;
   }
   const week = meetingWeek(istToday());
-  const [{ data: dRow }, { data: kRows }, { data: rRow }, { data: sess }] = await Promise.all([
+  const [{ data: dRow }, { data: kRows }, { data: rRow }, { data: sess }, st] = await Promise.all([
     db.from("departments").select("*").eq("id", profile.dept_id).maybeSingle(),
     db.from("kpis").select("*").eq("dept_id", profile.dept_id),
     db.from("results").select("*").eq("week", week).eq("dept_id", profile.dept_id).maybeSingle(),
-    db.from("wa_sessions").select("*").eq("phone", profile.phone).maybeSingle()
+    db.from("wa_sessions").select("*").eq("phone", profile.phone).maybeSingle(),
+    getSettings(db)
   ]);
   if (!dRow) {
     await reply("\u0D28\u0D3F\u0D19\u0D4D\u0D19\u0D33\u0D41\u0D1F\u0D46 \u0D35\u0D15\u0D41\u0D2A\u0D4D\u0D2A\u0D4D \u0D15\u0D23\u0D4D\u0D1F\u0D46\u0D24\u0D4D\u0D24\u0D3E\u0D28\u0D3E\u0D2F\u0D3F\u0D32\u0D4D\u0D32. Admin-\u0D28\u0D46 \u0D05\u0D31\u0D3F\u0D2F\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D15.");
     return;
   }
   const dept = buildDepts([dRow], kRows || [])[profile.dept_id];
-  const res = rRow ? mapResult(rRow) : { week, dept: profile.dept_id, status: "draft", rows: {}, priorities: [], support: "", ai: null, clar: [], source: "whatsapp" };
+  const res = rRow ? mapResult(rRow) : { week, dept: profile.dept_id, status: "draft", rows: {}, priorities: [], support: "", source: "whatsapp" };
   const byId = Object.fromEntries(dept.items.map((i) => [i.id, i]));
+  const scope = st.bot_scope;
+  const prog = () => progressOf(dept, res.rows, scope);
   let s = sess && sess.week === week ? { ...sess } : null;
-  const save = async () => {
-    const sm = summarize(res.rows);
-    const { error } = await db.from("results").upsert({
-      week,
-      dept_id: profile.dept_id,
-      status: res.status,
-      rows: res.rows,
-      priorities: res.priorities,
-      support: res.support,
-      score: sm.score,
-      counts: sm.counts,
-      ai: res.ai,
-      clar: res.clar,
-      source: "whatsapp",
-      updated_by: profile.id,
-      updated_at: (/* @__PURE__ */ new Date()).toISOString()
-    }, { onConflict: "week,dept_id" });
+  const saveSession = async () => {
+    await db.from("wa_sessions").upsert({ phone: profile.phone, user_id: profile.id, dept_id: profile.dept_id, week, step: s.step, idx: s.idx, items: s.items, sub: s.sub ?? null, updated_at: (/* @__PURE__ */ new Date()).toISOString() });
+  };
+  const saveRow = async (id, row) => {
+    const it = byId[id];
+    const full = { ...row, no: it.no, text: it.text, target: it.target, star: !!it.star, kraNo: it.kraNo, freq: it.freq, files: filesOf(row), updated_at: (/* @__PURE__ */ new Date()).toISOString() };
+    delete full.rag;
+    res.rows[id] = full;
+    const { error } = await db.rpc("save_kpi", { p_week: week, p_dept: profile.dept_id, p_kpi: id, p_row: full, p_source: "whatsapp", p_complete: prog().complete });
     if (error) throw new Error(error.message);
   };
-  const saveSession = async () => {
-    s.updated_at = (/* @__PURE__ */ new Date()).toISOString();
-    await db.from("wa_sessions").upsert({ phone: profile.phone, user_id: profile.id, dept_id: profile.dept_id, week, step: s.step, idx: s.idx, items: s.items, sub: s.sub ?? null, updated_at: s.updated_at });
-  };
+  const cur = () => s && s.step === "kpi" ? s.items[s.idx] : null;
   const storeMedia = async (folder) => {
     const m = media;
     const { bytes, mime } = await downloadMedia(m.id);
@@ -775,20 +1023,11 @@ ${lines.join("\n")}`);
     if (up.error) throw new Error(up.error.message);
     return { path, name, type, size: bytes.length, kind, at: (/* @__PURE__ */ new Date()).toISOString(), via: "whatsapp" };
   };
-  const attach = async (kpiId) => {
-    const meta = await storeMedia(kpiId);
-    const it = byId[kpiId];
-    const base = it ? { no: it.no, text: it.text, target: it.target, star: !!it.star, kraNo: it.kraNo, freq: it.freq } : {};
-    const old = res.rows[kpiId] || { actual: "", ach: null };
-    res.rows[kpiId] = { ...old, ...base, files: [...filesOf(old), meta] };
-    await save();
-    return meta.kind;
-  };
-  const attachOrSay = async (kpiId, flag) => {
+  const attach = async (id) => {
     try {
-      if (kpiId) return await attach(kpiId);
-      const meta = await storeMedia("_general");
-      if (flag) flag.files = [...flag.files || [], meta];
+      const meta = await storeMedia(id);
+      const old = res.rows[id] || { actual: "", ach: null };
+      await saveRow(id, { ...old, files: [...filesOf(old), meta] });
       return meta.kind;
     } catch (e) {
       console.error("attach failed", e);
@@ -796,282 +1035,243 @@ ${lines.join("\n")}`);
       return null;
     }
   };
-  const start = async (fromBeginning) => {
-    const st = await getSettings(db);
-    let items = itemsFor(dept, false);
-    if (st.bot_scope === "headline") items = items.filter((i) => i.star);
-    s = { step: "kpi", idx: 0, items: items.map((i) => i.id), sub: null };
-    if (!s.items.length) {
-      s.step = "priorities";
-    } else if (!fromBeginning) {
-      const first = s.items.findIndex((id) => !hasValue(res.rows[id]));
-      s.idx = first < 0 ? s.items.length : first;
-    }
-    if (res.status === "submitted" && fromBeginning) {
-      res.status = "draft";
-      await save();
-    }
+  const showMenu = async (all = false) => {
+    const pg = prog();
+    const list = all ? pg.list : pg.pending;
+    s = { step: "menu", idx: 0, items: list.map((x) => x.item.id), sub: all ? "all" : null };
     await saveSession();
-    await reply(`\u0D28\u0D2E\u0D38\u0D4D\u0D15\u0D3E\u0D30\u0D02 ${profile.full_name || ""}.
-*${dept.name}* \u2013 \u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 KPI \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D (${weekRange(week)}, \u0D2E\u0D40\u0D31\u0D4D\u0D31\u0D3F\u0D02\u0D17\u0D4D ${fmt(week)}).
-${s.items.length} KPI. \u0D13\u0D30\u0D4B\u0D28\u0D4D\u0D28\u0D3F\u0D28\u0D41\u0D02 \u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.
-SKIP \xB7 BACK \xB7 STOP \xB7 HELP`);
-    await askCurrent();
+    if (!list.length) {
+      if (pg.total) return reply(`*${dept.name}* \xB7 ${weekRange(week)}
+\u0D0E\u0D32\u0D4D\u0D32\u0D3E ${pg.total} KPI-\u0D15\u0D33\u0D41\u0D02 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F \u2713 \u0D28\u0D28\u0D4D\u0D26\u0D3F!
+\u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D02 \u0D35\u0D47\u0D23\u0D2E\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D ALL \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`);
+      return reply("\u0D08 \u0D06\u0D34\u0D4D\u0D1A \u0D28\u0D3F\u0D19\u0D4D\u0D19\u0D7E\u0D15\u0D4D\u0D15\u0D4D KPI \u0D07\u0D32\u0D4D\u0D32.");
+    }
+    const lines = list.map((x, i) => `${i + 1}. ${x.state === "done" ? "\u2713 " : ""}KPI ${x.item.no}${x.item.star ? "\u2605" : ""} \u2013 ${x.item.text.slice(0, 48)}${x.item.text.length > 48 ? "\u2026" : ""}`);
+    return reply(`\u0D28\u0D2E\u0D38\u0D4D\u0D15\u0D3E\u0D30\u0D02 ${profile.full_name || ""}.
+*${dept.name}* \xB7 ${weekRange(week)} \xB7 ${pg.done}/${pg.total} \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F
+\u0D36\u0D28\u0D3F\u0D2F\u0D3E\u0D34\u0D4D\u0D1A 5 PM-\u0D28\u0D4D \u0D2E\u0D41\u0D2E\u0D4D\u0D2A\u0D4D \u0D24\u0D40\u0D7C\u0D15\u0D4D\u0D15\u0D41\u0D15.
+
+*${all ? "\u0D0E\u0D32\u0D4D\u0D32\u0D3E KPI" : "\u0D2C\u0D3E\u0D15\u0D4D\u0D15\u0D3F\u0D2F\u0D41\u0D33\u0D4D\u0D33 KPI"}:*
+${lines.join("\n")}
+
+\u0D12\u0D30\u0D41 KPI \u0D24\u0D3F\u0D30\u0D1E\u0D4D\u0D1E\u0D46\u0D1F\u0D41\u0D15\u0D4D\u0D15\u0D3E\u0D7B \u0D05\u0D24\u0D3F\u0D28\u0D4D\u0D31\u0D46 *\u0D28\u0D2E\u0D4D\u0D2A\u0D7C* \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15, \u0D15\u0D4D\u0D30\u0D2E\u0D24\u0D4D\u0D24\u0D3F\u0D7D \u0D2A\u0D4B\u0D15\u0D3E\u0D7B *OK*.`);
   };
-  const askCurrent = async () => {
-    if (s.step === "kpi") {
-      if (s.idx >= s.items.length) {
-        s.step = "priorities";
-        s.idx = 0;
+  const openKpi = async (id) => {
+    const pg = prog();
+    const pos = pg.list.findIndex((x) => x.item.id === id);
+    s = { step: "kpi", idx: Math.max(0, s && s.items ? s.items.indexOf(id) : 0), items: s && s.items && s.items.includes(id) ? s.items : [id], sub: null };
+    await saveSession();
+    return reply(askKpi(byId[id], pos + 1, pg.total, res.rows[id]));
+  };
+  const nextPending = async () => {
+    const pg = prog();
+    if (pg.complete || !pg.pending.length) {
+      if (!(res.priorities || []).some(Boolean)) {
+        s = { step: "plan", idx: 0, items: [], sub: "pri" };
         await saveSession();
-        return reply(ASK_PRI);
+        return reply(`\u{1F389} \u0D0E\u0D32\u0D4D\u0D32\u0D3E KPI-\u0D15\u0D33\u0D41\u0D02 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F (${pg.done}/${pg.total}). \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D38\u0D2E\u0D7C\u0D2A\u0D4D\u0D2A\u0D3F\u0D1A\u0D4D\u0D1A\u0D41 \u2713
+
+${ASK_PRI}`);
       }
-      const it = byId[s.items[s.idx]];
-      if (!it) {
-        s.idx++;
-        return askCurrent();
-      }
-      if (s.sub === "reason") return reply(ASK_REASON(it.no, statusOf(res.rows[it.id])));
-      if (s.sub === "next") return reply(ASK_NEXT(it.no));
-      return reply(askKpi(it, s.idx, s.items.length, res.rows[it.id]));
+      s = { step: "done", idx: 0, items: [], sub: null };
+      await saveSession();
+      return reply(`\u{1F389} \u0D0E\u0D32\u0D4D\u0D32\u0D3E KPI-\u0D15\u0D33\u0D41\u0D02 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F (${pg.done}/${pg.total}). \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D38\u0D2E\u0D7C\u0D2A\u0D4D\u0D2A\u0D3F\u0D1A\u0D4D\u0D1A\u0D41 \u2713 \u0D28\u0D28\u0D4D\u0D26\u0D3F!`);
     }
-    if (s.step === "priorities") return reply(ASK_PRI);
-    if (s.step === "support") return reply(ASK_SUP);
-    if (s.step === "clarify") {
-      const fl = res.ai?.flags || [];
-      return reply(askFlag(fl[s.idx], s.idx, fl.length));
-    }
+    const order = s && s.items && s.items.length ? s.items : pg.pending.map((x) => x.item.id);
+    const nextId = order.find((id) => kpiState(res.rows[id]) !== "done") || pg.pending[0].item.id;
+    s = { step: "kpi", idx: order.includes(nextId) ? order.indexOf(nextId) : 0, items: order.includes(nextId) ? order : [nextId], sub: null };
+    await saveSession();
+    const pos = pg.list.findIndex((x) => x.item.id === nextId);
+    return reply(askKpi(byId[nextId], pos + 1, pg.total, res.rows[nextId]));
   };
-  const runCheck = async () => {
-    await reply("\u0D28\u0D28\u0D4D\u0D26\u0D3F. Claude \u0D28\u0D3F\u0D19\u0D4D\u0D19\u0D33\u0D41\u0D1F\u0D46 \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D2A\u0D30\u0D3F\u0D36\u0D4B\u0D27\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D28\u0D4D\u0D28\u0D41\u2026 \u0D12\u0D30\u0D41 \u0D2E\u0D3F\u0D28\u0D3F\u0D31\u0D4D\u0D31\u0D4D.");
-    for (const f of res.ai?.flags || []) if ((f.answer || "").trim() && !res.clar.some((c) => c.question === f.question)) res.clar.push({ kpiNo: f.kpiNo, question: f.question, answer: f.answer, at: (/* @__PURE__ */ new Date()).toISOString() });
+  const runCheck = async (id) => {
+    const it = byId[id];
+    const row = res.rows[id];
+    await reply(`Claude KPI ${it.no} \u0D2A\u0D30\u0D3F\u0D36\u0D4B\u0D27\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D28\u0D4D\u0D28\u0D41${filesOf(row).length ? " (\u0D24\u0D46\u0D33\u0D3F\u0D35\u0D41\u0D02 \u0D35\u0D3E\u0D2F\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D28\u0D4D\u0D28\u0D41)" : ""}\u2026`);
+    const earlier = [...row.qa || [], ...(row.ai && row.ai.questions || []).filter((q) => (q.answer || "").trim()).map((q) => ({ q: q.q, a: q.answer }))];
     try {
-      const out = await checkSheet({
-        deptName: dept.name,
-        hod: dept.hod,
-        week: weekRange(week),
-        meeting: fmt(week),
-        rows: checkRows(dept, res.rows),
-        missing: missingHeadline(dept, res.rows),
-        priorities: res.priorities,
-        support: res.support,
-        clarifications: res.clar.map((c) => ({ kpi: c.kpiNo, q: c.question, a: c.answer }))
-      }, 5);
-      res.ai = { ...out, at: (/* @__PURE__ */ new Date()).toISOString(), hash: rowsHash(res.rows), flags: out.flags.map((f) => ({ ...f, answer: "" })) };
-      await save();
+      const out = await checkKpi({ deptName: dept.name, hod: dept.hod, week: weekRange(week), kpi: kpiCheckInput(it, row), earlier, storage: db.storage, files: filesOf(row) });
+      const next = { ...row, qa: earlier.slice(-10), ai: { ...out, at: (/* @__PURE__ */ new Date()).toISOString() } };
+      next.ai.hash = kpiHash(next);
+      await saveRow(id, next);
     } catch (e) {
       console.error("claude check failed", e);
-      await reply("Claude \u0D2A\u0D30\u0D3F\u0D36\u0D4B\u0D27\u0D28 \u0D07\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E \u0D28\u0D1F\u0D28\u0D4D\u0D28\u0D3F\u0D32\u0D4D\u0D32. \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D38\u0D2E\u0D7C\u0D2A\u0D4D\u0D2A\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D28\u0D4D\u0D28\u0D41; MD \u0D13\u0D2B\u0D40\u0D38\u0D4D \u0D2A\u0D3F\u0D28\u0D4D\u0D28\u0D40\u0D1F\u0D4D \u0D2A\u0D30\u0D3F\u0D36\u0D4B\u0D27\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D02.");
-      return finish();
+      const skipped = { ...row, done: true, ai: { verdict: "skipped", summary: "", proof: null, questions: [], at: (/* @__PURE__ */ new Date()).toISOString() } };
+      skipped.ai.hash = kpiHash(skipped);
+      await saveRow(id, skipped);
+      await reply(`Claude \u0D2A\u0D30\u0D3F\u0D36\u0D4B\u0D27\u0D28 \u0D07\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E \u0D28\u0D1F\u0D28\u0D4D\u0D28\u0D3F\u0D32\u0D4D\u0D32. KPI ${it.no} \u0D38\u0D47\u0D35\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D24\u0D41 (MD \u0D13\u0D2B\u0D40\u0D38\u0D4D \u0D2A\u0D3F\u0D28\u0D4D\u0D28\u0D40\u0D1F\u0D4D \u0D28\u0D4B\u0D15\u0D4D\u0D15\u0D41\u0D02).`);
+      return nextPending();
     }
-    if (!res.ai.flags.length) return finish();
-    s.step = "clarify";
-    s.idx = 0;
-    await saveSession();
-    await reply(`Claude-\u0D28\u0D4D ${res.ai.flags.length} \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D19\u0D4D\u0D19\u0D33\u0D41\u0D23\u0D4D\u0D1F\u0D4D. \u0D13\u0D30\u0D4B\u0D28\u0D4D\u0D28\u0D3F\u0D28\u0D41\u0D02 \u0D2E\u0D31\u0D41\u0D2A\u0D1F\u0D3F \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`);
-    return askCurrent();
-  };
-  const finish = async () => {
-    res.status = "submitted";
-    await save();
-    s.step = "done";
-    s.idx = 0;
-    await saveSession();
-    const sm = summarize(res.rows);
-    let msg = `*\u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D38\u0D2E\u0D7C\u0D2A\u0D4D\u0D2A\u0D3F\u0D1A\u0D4D\u0D1A\u0D41. \u0D28\u0D28\u0D4D\u0D26\u0D3F.*
-${dept.name} \xB7 ${weekRange(week)}
-\u0D38\u0D4D\u0D15\u0D4B\u0D7C ${sm.score != null ? sm.score + "%" : "\u2014"} \xB7 Green ${sm.counts.G} \xB7 Amber ${sm.counts.A} \xB7 Red ${sm.counts.R}`;
-    if (res.ai) msg += `
-Claude \u0D35\u0D3F\u0D32\u0D2F\u0D3F\u0D30\u0D41\u0D24\u0D4D\u0D24\u0D7D: ${RATING_ML[res.ai.rating] || res.ai.rating}${res.ai.score != null ? ` (${res.ai.score}/100)` : ""}`;
-    if (res.ai?.suggestions?.length) msg += `
+    const ai = res.rows[id].ai;
+    let msg = `*Claude \xB7 KPI ${it.no}*
+${ai.summary || ""}`;
+    if (ai.proof) msg += `
+\u{1F4CE} ${ai.proof.read ? ai.proof.count != null ? `\u0D24\u0D46\u0D33\u0D3F\u0D35\u0D3F\u0D7D: *${ai.proof.count}*${ai.proof.matches === true ? " \u2713 \u0D36\u0D30\u0D3F" : ai.proof.matches === false ? " \u2717 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D41\u0D2E\u0D3E\u0D2F\u0D3F \u0D1A\u0D47\u0D30\u0D41\u0D28\u0D4D\u0D28\u0D3F\u0D32\u0D4D\u0D32" : ""}` : "\u0D24\u0D46\u0D33\u0D3F\u0D35\u0D4D \u0D35\u0D3E\u0D2F\u0D3F\u0D1A\u0D4D\u0D1A\u0D41" : "\u0D24\u0D46\u0D33\u0D3F\u0D35\u0D4D \u0D35\u0D3E\u0D2F\u0D3F\u0D15\u0D4D\u0D15\u0D3E\u0D28\u0D3E\u0D2F\u0D3F\u0D32\u0D4D\u0D32"}${ai.proof.note ? "\n" + ai.proof.note : ""}`;
+    if (!(ai.questions || []).length) {
+      await saveRow(id, { ...res.rows[id], done: true });
+      await reply(msg + `
 
-*\u0D28\u0D3F\u0D7C\u0D26\u0D4D\u0D26\u0D47\u0D36\u0D19\u0D4D\u0D19\u0D7E*
-${res.ai.suggestions.map((x) => "\u2022 " + x).join("\n")}`;
-    msg += "\n\n\u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D02 \u0D35\u0D47\u0D23\u0D2E\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D RESTART \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15, \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D06\u0D2A\u0D4D\u0D2A\u0D4D \u0D24\u0D41\u0D31\u0D15\u0D4D\u0D15\u0D41\u0D15.";
-    return reply(msg);
-  };
-  if (is(cmd, "help")) return reply(HELP);
-  if (is(cmd, "restart")) return start(true);
-  if (is(cmd, "status")) {
-    const items = itemsFor(dept, false);
-    const done = items.filter((i) => hasValue(res.rows[i.id])).length;
-    return reply(`${dept.name} \xB7 ${weekRange(week)}
-${done}/${items.length} KPI \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F \xB7 ${res.status === "submitted" ? "\u0D38\u0D2E\u0D7C\u0D2A\u0D4D\u0D2A\u0D3F\u0D1A\u0D4D\u0D1A\u0D41" : "\u0D38\u0D2E\u0D7C\u0D2A\u0D4D\u0D2A\u0D3F\u0D1A\u0D4D\u0D1A\u0D3F\u0D1F\u0D4D\u0D1F\u0D3F\u0D32\u0D4D\u0D32"}`);
-  }
-  if (!s || s.step === "invited" || s.step === "idle") return start(false);
-  if (s.step === "paused") {
-    s.step = s.sub || "kpi";
-    s.sub = null;
-    await saveSession();
-    await reply("\u0D24\u0D41\u0D1F\u0D30\u0D3E\u0D02.");
-    return askCurrent();
-  }
-  if (s.step === "done") {
-    if (is(cmd, "start")) return reply(`\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D24\u0D4D\u0D24\u0D46 \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D07\u0D24\u0D3F\u0D28\u0D15\u0D02 \u0D38\u0D2E\u0D7C\u0D2A\u0D4D\u0D2A\u0D3F\u0D1A\u0D4D\u0D1A\u0D41 (${summarize(res.rows).score ?? "\u2014"}%). \u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D02 \u0D35\u0D47\u0D23\u0D2E\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D RESTART \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`);
-    return reply("\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D24\u0D4D\u0D24\u0D46 \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D38\u0D2E\u0D7C\u0D2A\u0D4D\u0D2A\u0D3F\u0D1A\u0D4D\u0D1A\u0D41. \u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D02 \u0D35\u0D47\u0D23\u0D2E\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D RESTART \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15. \u0D38\u0D39\u0D3E\u0D2F\u0D24\u0D4D\u0D24\u0D3F\u0D28\u0D4D HELP.");
-  }
-  if (is(cmd, "stop")) {
-    s.sub = s.step;
-    s.step = "paused";
-    await saveSession();
-    return reply("\u0D36\u0D30\u0D3F, \u0D28\u0D3F\u0D7C\u0D24\u0D4D\u0D24\u0D3F. \u0D24\u0D41\u0D1F\u0D30\u0D3E\u0D7B \u0D0E\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E \u0D35\u0D47\u0D23\u0D2E\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D32\u0D41\u0D02 START \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15. \u0D36\u0D28\u0D3F\u0D2F\u0D3E\u0D34\u0D4D\u0D1A 4:30-\u0D28\u0D4D \u0D2E\u0D41\u0D2E\u0D4D\u0D2A\u0D4D \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D15\u0D4D\u0D15\u0D41\u0D15.");
-  }
-  if (is(cmd, "start")) return askCurrent();
-  if (s.step === "kpi") {
-    const id = s.items[s.idx];
-    const it = byId[id];
-    if (!it) {
-      s.idx++;
-      await saveSession();
-      return askCurrent();
+\u2713 KPI ${it.no} \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F (${prog().done}/${prog().total}).`);
+      return nextPending();
     }
-    if (is(cmd, "back")) {
+    s.sub = "q:0";
+    await saveSession();
+    await reply(msg);
+    return askQ(id, 0);
+  };
+  const askQ = (id, qi) => {
+    const q = res.rows[id].ai.questions[qi];
+    const n = res.rows[id].ai.questions.length;
+    return reply(`*\u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D02 ${qi + 1}/${n}*${q.severity === "high" ? " (\u0D2E\u0D31\u0D41\u0D2A\u0D1F\u0D3F \u0D28\u0D3F\u0D7C\u0D2C\u0D28\u0D4D\u0D27\u0D02)" : " (\u0D35\u0D47\u0D23\u0D4D\u0D1F\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D SKIP)"}
+${q.q}`);
+  };
+  const afterFigure = async (id) => {
+    const row = res.rows[id];
+    const st2 = kpiState(row);
+    if (st2 === "need-reason") {
+      s.sub = "reason";
+      await saveSession();
+      return reply(ASK_REASON(byId[id].no, statusOf(row)));
+    }
+    if (st2 === "need-next") {
+      s.sub = "next";
+      await saveSession();
+      return reply(ASK_NEXT(byId[id].no));
+    }
+    return runCheck(id);
+  };
+  if (!media) {
+    if (is(cmd, "help")) return reply(HELP);
+    if (is(cmd, "status")) {
+      const pg = prog();
+      return reply(`${dept.name} \xB7 ${weekRange(week)}
+${pg.done}/${pg.total} KPI \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F${pg.complete ? " \u2713 \u0D38\u0D2E\u0D7C\u0D2A\u0D4D\u0D2A\u0D3F\u0D1A\u0D4D\u0D1A\u0D41" : ` \xB7 ${pg.pending.length} \u0D2C\u0D3E\u0D15\u0D4D\u0D15\u0D3F`}
+\u0D32\u0D3F\u0D38\u0D4D\u0D31\u0D4D\u0D31\u0D3F\u0D28\u0D4D MENU.`);
+    }
+    if (is(cmd, "menu") || is(cmd, "start") && (!s || ["menu", "done", "idle", "invited", "paused"].includes(s.step))) return showMenu(false);
+    if (is(cmd, "all")) return showMenu(true);
+    if (is(cmd, "stop")) {
+      if (s) {
+        s.sub = s.step + "|" + (s.sub || "");
+        s.step = "paused";
+        await saveSession();
+      }
+      return reply("\u0D36\u0D30\u0D3F, \u0D28\u0D3F\u0D7C\u0D24\u0D4D\u0D24\u0D3F. \u0D0E\u0D32\u0D4D\u0D32\u0D3E\u0D02 \u0D38\u0D47\u0D35\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D24\u0D3F\u0D1F\u0D4D\u0D1F\u0D41\u0D23\u0D4D\u0D1F\u0D4D. \u0D24\u0D41\u0D1F\u0D30\u0D3E\u0D7B START \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15. \u0D36\u0D28\u0D3F\u0D2F\u0D3E\u0D34\u0D4D\u0D1A 5 PM-\u0D28\u0D4D \u0D2E\u0D41\u0D2E\u0D4D\u0D2A\u0D4D \u0D24\u0D40\u0D7C\u0D15\u0D4D\u0D15\u0D41\u0D15.");
+    }
+  }
+  if (!s || ["invited", "idle", "paused"].includes(s.step)) return showMenu(false);
+  if (s.step === "menu") {
+    if (media) return reply("\u0D06\u0D26\u0D4D\u0D2F\u0D02 \u0D12\u0D30\u0D41 KPI \u0D24\u0D3F\u0D30\u0D1E\u0D4D\u0D1E\u0D46\u0D1F\u0D41\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D28\u0D2E\u0D4D\u0D2A\u0D7C \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15), \u0D0E\u0D28\u0D4D\u0D28\u0D3F\u0D1F\u0D4D\u0D1F\u0D4D \u0D24\u0D46\u0D33\u0D3F\u0D35\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.");
+    const n = parseInt(cmd, 10);
+    if (Number.isFinite(n) && n >= 1 && n <= s.items.length && /^\d+$/.test(cmd)) return openKpi(s.items[n - 1]);
+    if (is(cmd, "ok") || is(cmd, "start")) return s.items.length ? openKpi(s.items[0]) : showMenu(false);
+    return reply(`\u0D32\u0D3F\u0D38\u0D4D\u0D31\u0D4D\u0D31\u0D3F\u0D32\u0D46 \u0D12\u0D30\u0D41 \u0D28\u0D2E\u0D4D\u0D2A\u0D7C (1\u2013${s.items.length}) \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15, \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D OK.`);
+  }
+  if (s.step === "kpi") {
+    const id = cur();
+    const it = id ? byId[id] : null;
+    if (!it) return showMenu(false);
+    const sub = String(s.sub || "");
+    if (!media && is(cmd, "back")) {
       s.sub = null;
       s.idx = Math.max(0, s.idx - 1);
       await saveSession();
-      return askCurrent();
+      return openKpi(s.items[s.idx]);
     }
-    if (s.sub === "reason") {
-      if (media) {
-        const kind = await attachOrSay(id);
-        if (!kind) return;
-        if (text) res.rows[id] = { ...res.rows[id], reason: text };
-        else if (!(res.rows[id].reason || "").trim()) res.rows[id] = { ...res.rows[id], reason: `(${KIND_ML[kind]} \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41)` };
-        await save();
-        s.sub = "next";
-        await saveSession();
-        return reply(`\u{1F4CE} ${KIND_ML[kind]} KPI ${it.no}-\u0D7D \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41.
-
-${ASK_NEXT(it.no)}`);
-      }
-      if (is(cmd, "skip")) {
-        s.sub = "next";
-        await saveSession();
-        return askCurrent();
-      }
-      res.rows[id] = { ...res.rows[id], reason: text };
-      await save();
-      s.sub = "next";
-      await saveSession();
-      return askCurrent();
-    }
-    if (s.sub === "next") {
-      if (media) {
-        const kind = await attachOrSay(id);
-        if (!kind) return;
-        res.rows[id] = { ...res.rows[id], next: text || `(${KIND_ML[kind]} \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41)` };
-        await save();
-      } else if (!is(cmd, "skip")) {
-        res.rows[id] = { ...res.rows[id], next: text };
-        await save();
-      }
+    if (!media && is(cmd, "skip") && !sub.startsWith("q:")) {
       s.sub = null;
       s.idx++;
       await saveSession();
-      await reply(`\u2713 KPI ${it.no} \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F.`);
-      return askCurrent();
+      if (s.idx >= s.items.length) return showMenu(false);
+      return openKpi(s.items[s.idx]);
+    }
+    if (sub.startsWith("q:")) {
+      const qi = parseInt(sub.slice(2), 10) || 0;
+      const row2 = res.rows[id];
+      const q = row2.ai && row2.ai.questions[qi];
+      if (!q) {
+        await saveRow(id, { ...row2, done: true });
+        return nextPending();
+      }
+      if (media) {
+        const kind = await attach(id);
+        if (!kind) return;
+        res.rows[id].ai.questions[qi].answer = text || `(${KIND_ML[kind]} \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41)`;
+        res.rows[id].ai.hash = kpiHash(res.rows[id]);
+      } else if (is(cmd, "skip")) {
+        if (q.severity === "high") return reply("\u0D08 \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D24\u0D4D\u0D24\u0D3F\u0D28\u0D4D \u0D2E\u0D31\u0D41\u0D2A\u0D1F\u0D3F \u0D28\u0D3F\u0D7C\u0D2C\u0D28\u0D4D\u0D27\u0D2E\u0D3E\u0D23\u0D4D. \u0D1A\u0D41\u0D30\u0D41\u0D15\u0D4D\u0D15\u0D3F \u0D0E\u0D34\u0D41\u0D24\u0D3F\u0D2F\u0D3E\u0D7D \u0D2E\u0D24\u0D3F, \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D2B\u0D4B\u0D1F\u0D4D\u0D1F\u0D4B / PDF \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.");
+      } else res.rows[id].ai.questions[qi].answer = text;
+      await saveRow(id, res.rows[id]);
+      if (qi + 1 < row2.ai.questions.length) {
+        s.sub = "q:" + (qi + 1);
+        await saveSession();
+        return askQ(id, qi + 1);
+      }
+      await saveRow(id, { ...res.rows[id], done: true });
+      s.sub = null;
+      await saveSession();
+      await reply(`\u2713 KPI ${it.no} \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F (${prog().done}/${prog().total}). \u0D28\u0D28\u0D4D\u0D26\u0D3F.`);
+      return nextPending();
+    }
+    if (sub === "reason") {
+      const row2 = res.rows[id] || {};
+      if (media) {
+        const kind = await attach(id);
+        if (!kind) return;
+        if (text || !(row2.reason || "").trim()) await saveRow(id, { ...res.rows[id], reason: text || `(${KIND_ML[kind]} \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41)` });
+      } else await saveRow(id, { ...row2, reason: text });
+      return afterFigure(id);
+    }
+    if (sub === "next") {
+      if (media) {
+        const kind = await attach(id);
+        if (!kind) return;
+        await saveRow(id, { ...res.rows[id], next: text || `(${KIND_ML[kind]} \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41)` });
+      } else await saveRow(id, { ...res.rows[id], next: text });
+      return afterFigure(id);
     }
     if (media) {
-      const kind = await attachOrSay(id);
+      const kind = await attach(id);
       if (!kind) return;
-      if (text) {
-        const a0 = parseAnswer(text, isManual(it));
-        if (a0.kind !== "number") {
-          res.rows[id] = { ...res.rows[id], data: [res.rows[id].data, text].filter(Boolean).join(" \xB7 ") };
-          await save();
-          return reply(`\u{1F4CE} ${KIND_ML[kind]} KPI ${it.no}-\u0D7D \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41. \u0D07\u0D28\u0D3F ${isManual(it) ? "\u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02" : "\u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D"} \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`);
-        }
-      } else return reply(`\u{1F4CE} ${KIND_ML[kind]} KPI ${it.no}-\u0D7D \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41. \u0D07\u0D28\u0D3F ${isManual(it) ? "\u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 (\u0D09\u0D26\u0D3E: 92)" : "\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D"} \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`);
+      const a0 = text ? parseAnswer(text, it) : { kind: "none" };
+      if (a0.kind !== "number") return reply(`\u{1F4CE} ${KIND_ML[kind]} KPI ${it.no}-\u0D7D \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41. \u0D07\u0D28\u0D3F ${answerKind(it) === "pct" ? "\u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 (\u0D09\u0D26\u0D3E: 92) \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D0E\u0D23\u0D4D\u0D23\u0D02 (46/48)" : "\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D"} \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`);
     }
-    if (is(cmd, "skip")) {
-      s.idx++;
-      await saveSession();
-      return askCurrent();
-    }
-    const a = parseAnswer(text, isManual(it));
-    if (a.kind === "colour") return reply(isManual(it) ? "\u0D28\u0D3F\u0D31\u0D02 \u0D24\u0D28\u0D3F\u0D2F\u0D46 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D3E\u0D15\u0D4D\u0D15\u0D41\u0D02. \u0D0E\u0D24\u0D4D\u0D30 \u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F \u0D0E\u0D28\u0D4D\u0D28\u0D4D \u0D2E\u0D3E\u0D24\u0D4D\u0D30\u0D02 \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 92)." : "\u0D28\u0D3F\u0D31\u0D02 \u0D24\u0D28\u0D3F\u0D2F\u0D46 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D3E\u0D15\u0D4D\u0D15\u0D41\u0D02. \u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D \u0D2E\u0D3E\u0D24\u0D4D\u0D30\u0D02 \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 1420).");
-    if (a.kind !== "number") return reply(isManual(it) ? "\u0D2E\u0D28\u0D38\u0D4D\u0D38\u0D3F\u0D32\u0D3E\u0D2F\u0D3F\u0D32\u0D4D\u0D32. \u0D0E\u0D24\u0D4D\u0D30 \u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F \u0D0E\u0D28\u0D4D\u0D28\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 92). \u0D12\u0D34\u0D3F\u0D35\u0D3E\u0D15\u0D4D\u0D15\u0D3E\u0D7B SKIP." : "\u0D12\u0D30\u0D41 \u0D28\u0D2E\u0D4D\u0D2A\u0D7C \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 1420). \u0D12\u0D34\u0D3F\u0D35\u0D3E\u0D15\u0D4D\u0D15\u0D3E\u0D7B SKIP.");
-    const base = { no: it.no, text: it.text, target: it.target, star: !!it.star, kraNo: it.kraNo, freq: it.freq };
+    const a = parseAnswer(text, it);
+    if (a.kind === "colour") return reply(`\u0D28\u0D3F\u0D31\u0D02 / Yes-No \u0D35\u0D47\u0D23\u0D4D\u0D1F \u2014 ${answerKind(it) === "pct" ? "\u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 (\u0D09\u0D26\u0D3E: 92) \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D0E\u0D23\u0D4D\u0D23\u0D02 (46/48)" : "\u0D0E\u0D23\u0D4D\u0D23\u0D02 / \u0D24\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 1420)"} \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15. \u0D28\u0D3F\u0D31\u0D02 \u0D24\u0D28\u0D3F\u0D2F\u0D46 \u0D35\u0D30\u0D41\u0D02 \u{1F512}`);
+    if (a.kind !== "number") return reply(answerKind(it) === "pct" ? "\u0D2E\u0D28\u0D38\u0D4D\u0D38\u0D3F\u0D32\u0D3E\u0D2F\u0D3F\u0D32\u0D4D\u0D32. \u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 (\u0D09\u0D26\u0D3E: 92) \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D0E\u0D23\u0D4D\u0D23\u0D02 (46/48) \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15. \u0D2A\u0D3F\u0D28\u0D4D\u0D28\u0D40\u0D1F\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D2F\u0D3E\u0D7B SKIP." : "\u0D12\u0D30\u0D41 \u0D28\u0D2E\u0D4D\u0D2A\u0D7C \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 1420). \u0D2A\u0D3F\u0D28\u0D4D\u0D28\u0D40\u0D1F\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D2F\u0D3E\u0D7B SKIP.");
     const old = res.rows[id] || {};
-    const ach = isManual(it) ? Math.max(0, Math.min(Math.round(parseFloat(a.value)), 120)) : calcAch(it, a.value);
-    const row = { ...old, ...base, actual: isManual(it) ? "" : a.value, ach };
-    delete row.rag;
+    const row = { ...old, actual: a.actual, ach: a.ach, done: false };
+    delete row.data;
     const rag = statusOf(row);
-    const bad = rag === "A" || rag === "R";
     if (a.note) {
-      if (bad) row.reason = a.note;
-      else row.data = a.note;
+      if ((rag === "A" || rag === "R") && !(old.reason || "").trim()) row.reason = a.note;
+      else row.reason = [old.reason, a.note].filter(Boolean).join(" \xB7 ");
     }
-    res.rows[id] = row;
-    await save();
-    const got = `\u2713 KPI ${it.no}: ${row.actual ? row.actual + " \u2192 " : ""}${row.ach != null ? row.ach + "% " : ""}${RAG_ML[rag] || ""} \u{1F512}`;
-    if (bad && !(row.reason || "").trim() && !filesOf(row).length) {
-      s.sub = "reason";
+    await saveRow(id, row);
+    await reply(`\u2713 KPI ${it.no}: ${row.actual}${row.ach != null ? " \u2192 " + row.ach + "%" : ""} ${RAG_ML[rag] || ""} \u{1F512}`);
+    return afterFigure(id);
+  }
+  if (s.step === "plan") {
+    if (media) return reply("\u0D07\u0D35\u0D3F\u0D1F\u0D46 \u0D1F\u0D48\u0D2A\u0D4D\u0D2A\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D24\u0D4D \u0D2E\u0D31\u0D41\u0D2A\u0D1F\u0D3F \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.");
+    if (s.sub === "pri") {
+      res.priorities = is(cmd, "skip") || is(cmd, "none") ? ["", "", ""] : text.split(/\n|;/).map((x) => x.replace(/^\s*[\d.)\-•*]+\s*/, "").trim()).filter(Boolean).slice(0, 3);
+      while (res.priorities.length < 3) res.priorities.push("");
+      await db.from("results").update({ priorities: res.priorities }).eq("week", week).eq("dept_id", profile.dept_id);
+      s.sub = "sup";
       await saveSession();
-      return reply(`${got}
-
-${ASK_REASON(it.no, rag)}`);
+      return reply(ASK_SUP);
     }
-    if (bad && !(row.next || "").trim()) {
-      s.sub = "next";
-      await saveSession();
-      return reply(`${got}
-
-${ASK_NEXT(it.no)}`);
-    }
-    s.idx++;
-    await saveSession();
-    await reply(got);
-    return askCurrent();
-  }
-  if (media && s.step === "clarify") {
-    const fl = res.ai?.flags || [];
-    const f = fl[s.idx];
-    if (!f) return finish();
-    const target = dept.items.find((i) => String(i.no) === String(f.kpiNo));
-    const kind = await attachOrSay(target ? target.id : null, f);
-    if (!kind) return;
-    f.answer = text || `(${KIND_ML[kind]} \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41${target ? " \xB7 KPI " + target.no : ""})`;
-    await save();
-    s.idx++;
-    await saveSession();
-    await reply(`\u{1F4CE} ${KIND_ML[kind]} \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41.`);
-    if (s.idx >= fl.length) return finish();
-    return askCurrent();
-  }
-  if (media) return reply("\u0D2B\u0D2F\u0D32\u0D41\u0D15\u0D7E KPI \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D19\u0D4D\u0D19\u0D7E\u0D15\u0D4D\u0D15\u0D41\u0D02 Claude-\u0D28\u0D4D\u0D31\u0D46 \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D19\u0D4D\u0D19\u0D7E\u0D15\u0D4D\u0D15\u0D41\u0D02 \u0D07\u0D1F\u0D2F\u0D3F\u0D7D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15. \u0D07\u0D35\u0D3F\u0D1F\u0D46 \u0D1F\u0D48\u0D2A\u0D4D\u0D2A\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D24\u0D4D \u0D2E\u0D31\u0D41\u0D2A\u0D1F\u0D3F \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.");
-  if (s.step === "priorities") {
-    res.priorities = is(cmd, "skip") || is(cmd, "none") ? ["", "", ""] : text.split(/\n|;/).map((x) => x.replace(/^\s*[\d.)\-•*]+\s*/, "").trim()).filter(Boolean).slice(0, 3);
-    while (res.priorities.length < 3) res.priorities.push("");
-    await save();
-    s.step = "support";
-    await saveSession();
-    return askCurrent();
-  }
-  if (s.step === "support") {
     res.support = is(cmd, "skip") || is(cmd, "none") ? "" : text;
-    await save();
-    s.step = "checking";
+    await db.from("results").update({ support: res.support }).eq("week", week).eq("dept_id", profile.dept_id);
+    s = { step: "done", idx: 0, items: [], sub: null };
     await saveSession();
-    return runCheck();
+    return reply("\u0D28\u0D28\u0D4D\u0D26\u0D3F! \u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D24\u0D4D\u0D24\u0D46 \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F \u2713\n\u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D02 \u0D35\u0D47\u0D23\u0D2E\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D ALL \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15, \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D06\u0D2A\u0D4D\u0D2A\u0D4D \u0D24\u0D41\u0D31\u0D15\u0D4D\u0D15\u0D41\u0D15.");
   }
-  if (s.step === "checking") return reply("Claude \u0D07\u0D2A\u0D4D\u0D2A\u0D4B\u0D34\u0D41\u0D02 \u0D2A\u0D30\u0D3F\u0D36\u0D4B\u0D27\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D28\u0D4D\u0D28\u0D41\u2026 \u0D15\u0D41\u0D31\u0D1A\u0D4D\u0D1A\u0D4D \u0D38\u0D2E\u0D2F\u0D02 \u0D15\u0D3E\u0D24\u0D4D\u0D24\u0D3F\u0D30\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D15.");
-  if (s.step === "clarify") {
-    const fl = res.ai?.flags || [];
-    const f = fl[s.idx];
-    if (!f) return finish();
-    if (is(cmd, "skip")) {
-      if (f.severity === "high") return reply("\u0D08 \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D24\u0D4D\u0D24\u0D3F\u0D28\u0D4D \u0D2E\u0D31\u0D41\u0D2A\u0D1F\u0D3F \u0D28\u0D3F\u0D7C\u0D2C\u0D28\u0D4D\u0D27\u0D2E\u0D3E\u0D23\u0D4D. \u0D1A\u0D41\u0D30\u0D41\u0D15\u0D4D\u0D15\u0D3F \u0D0E\u0D34\u0D41\u0D24\u0D3F\u0D2F\u0D3E\u0D7D \u0D2E\u0D24\u0D3F.");
-    } else {
-      f.answer = text;
-      await save();
-    }
-    s.idx++;
-    await saveSession();
-    if (s.idx >= fl.length) return finish();
-    return askCurrent();
+  if (s.step === "done") {
+    if (media) return reply("\u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F. \u0D12\u0D30\u0D41 KPI-\u0D7D \u0D24\u0D46\u0D33\u0D3F\u0D35\u0D4D \u0D1A\u0D47\u0D7C\u0D15\u0D4D\u0D15\u0D3E\u0D7B ALL \u0D05\u0D2F\u0D1A\u0D4D\u0D1A\u0D4D \u0D06 KPI \u0D24\u0D3F\u0D30\u0D1E\u0D4D\u0D1E\u0D46\u0D1F\u0D41\u0D15\u0D4D\u0D15\u0D41\u0D15.");
+    return reply(`\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D24\u0D4D\u0D24\u0D46 \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F \u2713 (${prog().done}/${prog().total}). \u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D02 \u0D35\u0D47\u0D23\u0D2E\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D ALL \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`);
   }
-  return start(false);
+  return showMenu(false);
 }
 
 // supabase/functions/whatsapp/index.ts
