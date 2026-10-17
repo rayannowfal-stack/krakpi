@@ -3,11 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#12343B">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <title>Atlas KPI Review</title>
   <meta name="description" content="Atlas Maharani Group - weekly KRA and KPI review for the Monday HOD meeting">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Manrope:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Manrope:wght@400;500;600;700&family=Noto+Sans+Malayalam:wght@400;600&display=swap">
 </head>
 <body>
   <header class="bar" id="bar" hidden>
@@ -18,18 +21,22 @@
         <div class="wl"><b id="wkMeet">Meeting</b><small id="wkRange">Week</small></div>
         <button id="wkNext" aria-label="Next week">&rsaquo;</button>
       </div>
-      <span class="role" id="roleChip"></span>
-      <button class="btn primary" id="pptBtn">Make PPT</button>
-      <button class="btn ghost small" id="signOut">Sign out</button>
+      <div class="bar-actions">
+        <span class="role" id="roleChip"></span>
+        <button class="btn primary" id="pptBtn">Make PPT</button>
+        <button class="btn ghost small" id="myPw">Password</button>
+        <button class="btn ghost small" id="signOut">Sign out</button>
+      </div>
     </div>
-    <nav class="tabs wrap" id="tabs">
+    <nav class="tabs wrap" id="tabs" aria-label="Sections">
       <button data-tab="overview">Overview</button>
       <button data-tab="submit">Submit results</button>
       <button data-tab="weekly">Weekly KPI list</button>
-      <button data-tab="master">All KRA &amp; KPI</button>
+      <button data-tab="master">KRA &amp; KPI</button>
       <button data-tab="pending">Pending points</button>
       <button data-tab="md">MD Office</button>
-      <button data-tab="users" id="usersTab" hidden>Users</button>
+      <button data-tab="users">Users</button>
+      <button data-tab="settings">Settings</button>
     </nav>
   </header>
   <main class="wrap" id="main"><div class="empty">Loading…</div></main>

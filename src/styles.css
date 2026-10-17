@@ -10,8 +10,8 @@ img{max-width:100%}
   --ink:#13262B; --muted:#5A6B6F; --brand:#12343B; --brand-fg:#FFFFFF;
   --gold:#B8892B; --gold-soft:#F3E6C8;
   --g:#25734A; --g-bg:#DDF0E4; --a:#9A6412; --a-bg:#F8E9CC; --r:#B23434; --r-bg:#F7DEDC; --na:#6B7779; --na-bg:#E4E9E8;
-  --f-display:"Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
-  --f-body:"Manrope", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --f-display:"Bricolage Grotesque", "Noto Sans Malayalam", "Segoe UI", system-ui, sans-serif;
+  --f-body:"Manrope", "Noto Sans Malayalam", "Segoe UI", system-ui, -apple-system, sans-serif;
   --radius:8px;
 }
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
@@ -83,9 +83,9 @@ table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
 th,td{padding:8px 10px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
 th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);background:var(--sunk);font-weight:700;white-space:nowrap}
 tr:last-child td{border-bottom:0}
-td.no{white-space:nowrap;color:var(--muted);font-weight:600}
+.no{white-space:nowrap;color:var(--muted);font-weight:700;margin-right:4px}
 td.kpi{min-width:240px}
-td.star{color:var(--gold);font-size:15px;width:24px}
+.star{color:var(--gold)}
 .kra-row td{background:var(--gold-soft);font-weight:700;font-size:13px}
 .freq{font-size:11px;font-weight:700;padding:1px 7px;border-radius:4px;background:var(--sunk);color:var(--muted);white-space:nowrap}
 .inp{width:100%;min-width:80px;border:1px solid var(--line);background:var(--bg);border-radius:6px;padding:6px 8px}
@@ -132,3 +132,73 @@ label.f .inp{color:var(--ink);font-weight:500;font-size:14px}
 .login{min-height:100vh;display:grid;place-items:center;padding:24px max(16px,env(safe-area-inset-left,0px))}
 .login .card{background:var(--surface);border:1px solid var(--line);border-top:5px double var(--gold);border-radius:12px;padding:28px;max-width:420px;width:100%;display:flex;flex-direction:column;gap:14px}
 .login h1{font-size:26px}
+
+/* ---------- v2: header group, WhatsApp badge, Malayalam text, forms ---------- */
+.bar-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pill.wa{background:var(--gold-soft);color:var(--ink)}
+.ml{line-height:1.75}
+.inline{display:flex;gap:6px;align-items:center}
+.inline .inp{flex:1;min-width:0}
+.f.end{justify-content:flex-end}
+.row-actions{white-space:nowrap}
+td .inp{min-width:0}
+#resTbl td.kpi{min-width:260px}
+#resTbl select.inp{min-width:128px}
+.savebar{position:sticky;bottom:0;background:var(--bg);padding-block:10px calc(10px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--line);z-index:3}
+
+/* Touch screens: bigger targets */
+@media (pointer:coarse){
+  .btn,.chip{min-height:42px}
+  .inp{min-height:42px;font-size:16px}  /* 16px stops iPhone zooming into fields */
+  nav.tabs button{padding:12px 14px}
+}
+
+/* Laptop / PC: use the width */
+@media (min-width:1440px){ .wrap{max-width:1400px} }
+
+/* Tablet and phone: compact header */
+@media (max-width:900px){
+  .bar-row{gap:8px 12px;padding-block:10px}
+  .brand b{font-size:18px}
+  .week{order:3;width:100%;justify-content:space-between}
+  .week .wl{flex:1}
+  .bar-actions{margin-left:auto}
+}
+@media (max-width:560px){
+  .bar-actions{width:100%;margin-left:0}
+  .bar-actions .role{margin-right:auto}
+  h2{font-size:20px}
+  .panel{padding:14px}
+  .stats{gap:16px}
+  .stat b{font-size:22px}
+  .modal{padding:16px;border-radius:10px}
+  .overlay{padding-top:calc(12px + env(safe-area-inset-top,0px))}
+  .toolbar .btn{flex:1 1 auto}
+}
+
+/* Tables become cards on phones (all .resp tables) and on tablets (the result sheet) */
+@media (max-width:720px){
+  .tbl-wrap:has(table.resp){border:0;overflow:visible}
+  table.resp, table.resp tbody, table.resp tr, table.resp td{display:block;width:100%}
+  table.resp thead{display:none}
+  table.resp tr{border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;margin-bottom:10px;background:var(--surface)}
+  table.resp tr.kra-row{background:var(--gold-soft);padding:8px 12px}
+  table.resp td{border:0;padding:4px 0;min-width:0!important}
+  table.resp td[data-label]:not([data-label=""])::before{content:attr(data-label);display:block;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:2px}
+  table.resp td.kpi{font-weight:600}
+  table.resp .inp{width:100%}
+  table.resp td.row-actions{padding-top:8px;display:flex;gap:8px;flex-wrap:wrap}
+}
+@media (min-width:721px) and (max-width:960px){
+  .tbl-wrap:has(table.sheet){border:0;overflow:visible}
+  table.sheet, table.sheet tbody, table.sheet tr{display:block;width:100%}
+  table.sheet thead{display:none}
+  table.sheet tr{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px 12px;border:1px solid var(--line);border-radius:var(--radius);padding:12px;margin-bottom:10px;background:var(--surface)}
+  table.sheet td{display:block;border:0;padding:0;min-width:0!important}
+  table.sheet td.kpi{grid-column:1/-1;font-weight:600}
+  table.sheet td:nth-child(5), table.sheet td:nth-child(6){grid-column:span 3}
+  table.sheet td[data-label]:not([data-label=""])::before{content:attr(data-label);display:block;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:2px}
+  table.sheet .inp{width:100%}
+}
+.savebar .grow:empty{display:none}
+@media (max-width:560px){ .savebar{flex-wrap:nowrap} .savebar .btn{flex:1 1 0} }

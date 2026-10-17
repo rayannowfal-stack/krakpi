@@ -1,19 +1,21 @@
 {
   "name": "atlas-kpi-review",
   "private": true,
-  "version": "1.0.0",
+  "version": "2.1.0",
   "type": "module",
-  "description": "Atlas Maharani Group - weekly KRA/KPI review for the Monday HOD meeting, with Claude review for the MD office",
+  "description": "Atlas Maharani Group - weekly KRA/KPI review: HOD results, WhatsApp bot, Claude review in Malayalam, Saturday PPT",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "bundle:functions": "node scripts/bundle-functions.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
-    "pptxgenjs": "^3.12.0"
+    "pptxgenjs": "^4.0.1"
   },
   "devDependencies": {
-    "vite": "^5.4.10"
+    "vite": "^5.4.10",
+    "esbuild": "^0.21.5"
   }
 }

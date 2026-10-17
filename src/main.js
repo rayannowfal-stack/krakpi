@@ -1,80 +1,49 @@
 // Atlas Maharani Group · Weekly KPI Review
-// Vanilla JS single-page app on Supabase (Postgres + Auth + Realtime + Edge Functions for Claude).
+// Vanilla JS single-page app on Supabase (Postgres + Auth + Realtime + Edge Functions for Claude and WhatsApp).
 import "./styles.css";
 import PptxGenJS from "pptxgenjs";
 import { supabase } from "./supabase.js";
+import {
+  FREQ, WEEKLY, RAGN, RATINGS, RATING_ML, addDays, fmt, fmtShort, meetingWeek, weekRange, ymd,
+  calcAch, ragOf, isManual, summarize, rowsHash, itemsFor, buildDepts, deptListOf,
+  mapResult, mapAction, mapProposal, repeatReds, checkRows, missingHeadline, normPhone, normUsername, userLogin,
+} from "../supabase/functions/_shared/core.js";
+import { buildDeck } from "../supabase/functions/_shared/ppt-builder.js";
 
 /* ---------- helpers ---------- */
 const LS = {
   get(k, d) { try { const v = localStorage.getItem("akr:" + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem("akr:" + k, JSON.stringify(v)); } catch (e) {} },
 };
-const FREQ = { D: "Daily", W: "Weekly", "15D": "15 days", M: "Monthly", Q: "Quarterly", H: "Half-yearly", Y: "Yearly", AN: "As needed" };
-const WEEKLY = new Set(["D", "W", "15D"]);
-const RAGN = { G: "Green", A: "Amber", R: "Red", NA: "No data" };
-const RATINGS = { "Result-oriented": "G", "Partly result-oriented": "A", "Activity only": "R" };
 const ROLES = { admin: "Admin", hod: "HOD", viewer: "Viewer", pending: "Pending" };
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const $ = (s) => document.querySelector(s);
-
-/* ---------- dates (week = Monday of the HOD meeting) ---------- */
-const pad = (n) => String(n).padStart(2, "0");
-const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const parseYmd = (s) => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
-const addDays = (s, n) => { const d = parseYmd(s); d.setDate(d.getDate() + n); return ymd(d); };
-const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const fmt = (s) => { const d = parseYmd(s); return `${d.getDate()} ${MON[d.getMonth()]} ${d.getFullYear()}`; };
-const fmtShort = (s) => { const d = parseYmd(s); return `${d.getDate()} ${MON[d.getMonth()]}`; };
-function defaultWeek() { const d = new Date(); const add = (8 - d.getDay()) % 7; d.setDate(d.getDate() + add); return ymd(d); }
 const today = () => ymd(new Date());
-const weekRange = (w) => `${fmtShort(addDays(w, -7))} – ${fmtShort(addDays(w, -1))}`;
 const nowIso = () => new Date().toISOString();
 const when = (iso) => (iso ? new Date(iso).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "");
+const TABS = { admin: ["overview", "submit", "weekly", "master", "pending", "md", "users", "settings"], viewer: ["overview", "weekly", "master", "pending", "md"], hod: ["submit", "weekly", "master", "pending"] };
 
 /* ---------- state ---------- */
 const S = {
   session: null, me: null, isAdmin: false, canWrite: false, ready: false,
-  depts: {}, proposals: [], results: {}, prev: {}, actions: [], review: null, profiles: [],
-  week: defaultWeek(), tab: LS.get("tab", "overview"), dept: LS.get("dept", "sales"),
+  depts: {}, proposals: [], results: {}, prev: {}, actions: [], review: null, profiles: [], settings: null, jobs: [],
+  week: meetingWeek(today()), tab: LS.get("tab", "overview"), dept: LS.get("dept", "sales"),
   showAll: false, weeklyDept: LS.get("wdept", "all"), masterDept: LS.get("mdept", "sales"), q: "",
   pendFilter: "open", pendDept: "all",
-  form: null, formDirty: false, aiBusy: false, mdBusy: false, channel: null,
+  form: null, formDirty: false, aiBusy: false, mdBusy: false, jobBusy: "", channel: null,
 };
-const deptList = () => Object.entries(S.depts).map(([id, d]) => ({ id, ...d })).sort((a, b) => (a.order || 99) - (b.order || 99));
-const nameOf = (uid) => { const p = S.profiles.find((x) => x.id === uid); return p ? p.full_name || p.email : uid ? "a team member" : ""; };
-const hodLocked = () => S.me && S.me.role === "hod" && S.me.dept_id;
-
-/* ---------- scoring ---------- */
-function calcAch(item, actual) {
-  const a = parseFloat(String(actual).replace(/,/g, ""));
-  if (actual === "" || actual == null || isNaN(a)) return null;
-  const t = item.tv;
-  if (item.dir === "zero") return a === 0 ? 100 : 0;
-  if (t == null || isNaN(t)) return null;
-  let v;
-  if (item.dir === "down") v = a <= t ? 100 : a === 0 ? 100 : (t / a) * 100;
-  else v = t === 0 ? (a > 0 ? 100 : 0) : (a / t) * 100;
-  return Math.round(Math.min(v, 120));
-}
-const ragOf = (ach) => (ach == null ? "" : ach >= 95 ? "G" : ach >= 80 ? "A" : "R");
-function summarize(rows) {
-  const c = { G: 0, A: 0, R: 0 }; let sum = 0, n = 0;
-  for (const r of Object.values(rows || {})) {
-    const rag = r.rag || ragOf(r.ach);
-    if (c[rag] != null) c[rag]++;
-    if (typeof r.ach === "number") { sum += Math.min(r.ach, 120); n++; }
-    else if (rag === "G") { sum += 100; n++; } else if (rag === "A") { sum += 87; n++; } else if (rag === "R") { sum += 60; n++; }
-  }
-  const score = n ? Math.round(sum / n) : null;
-  return { score, counts: c, rag: score == null ? "none" : ragOf(score) };
-}
+const deptList = () => deptListOf(S.depts);
+const nameOf = (uid) => { const p = S.profiles.find((x) => x.id === uid); return p ? p.full_name || p.username || p.phone : uid ? "a team member" : ""; };
+const role = () => (S.me && S.me.role) || "pending";
+const hodLocked = () => role() === "hod" && S.me.dept_id;
+const mayEditDept = (id) => S.isAdmin || (role() === "hod" && S.me.dept_id === id);
 
 /* ---------- toast & modal ---------- */
 let toastT;
 function toast(msg) {
   let el = $(".toast");
   if (!el) { el = document.createElement("div"); el.className = "toast"; el.setAttribute("role", "status"); document.body.appendChild(el); }
-  el.textContent = msg; el.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => (el.hidden = true), 3500);
+  el.textContent = msg; el.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => (el.hidden = true), 4000);
 }
 function openModal(html, onReady) {
   const root = $("#modalRoot");
@@ -92,31 +61,14 @@ function confirmModal(text, label, fn) {
 }
 
 /* ---------- database: read ---------- */
-function mapKpi(k) {
-  return { id: k.id, kraNo: k.kra_no, kra: k.kra, kraW: Number(k.kra_weight) || 0, no: k.no, text: k.text, target: k.target,
-    tv: k.tv == null ? null : Number(k.tv), dir: k.dir, freq: k.freq, owner: k.owner, star: k.star };
-}
-function mapResult(r) {
-  return { week: r.week, dept: r.dept_id, status: r.status, rows: r.rows || {}, priorities: r.priorities || [], support: r.support || "",
-    ai: r.ai || null, clar: r.clar || [], by: r.updated_by, at: r.updated_at };
-}
-const mapAction = (a) => ({ _id: a.id, dept: a.dept_id, week: a.week, kpiNo: a.kpi_no, kpiText: a.kpi_text, action: a.action, owner: a.owner, due: a.due, status: a.status, result: a.result });
-const mapProposal = (p) => ({ _id: p.id, dept: p.dept_id, kraNo: p.kra_no, kraName: p.kra_name, text: p.text, target: p.target, freq: p.freq, owner: p.owner, note: p.note, status: p.status, by: p.created_by });
-
 async function loadDepts() {
-  const [{ data: ds, error: e1 }, { data: ks, error: e2 }] = await Promise.all([
-    supabase.from("departments").select("*"),
-    supabase.from("kpis").select("*"),
-  ]);
+  const [{ data: ds, error: e1 }, { data: ks, error: e2 }] = await Promise.all([supabase.from("departments").select("*"), supabase.from("kpis").select("*")]);
   if (e1 || e2) { toast("Couldn't load departments: " + (e1 || e2).message); return; }
-  const m = {};
-  (ds || []).forEach((d) => (m[d.id] = { name: d.name, hod: d.hod, order: d.sort_order, items: [] }));
-  (ks || []).forEach((k) => m[k.dept_id] && m[k.dept_id].items.push(mapKpi(k)));
-  S.depts = m;
+  S.depts = buildDepts(ds, ks);
 }
 async function loadProposals() { const { data } = await supabase.from("proposals").select("*").order("created_at", { ascending: false }); S.proposals = (data || []).map(mapProposal); }
 async function loadActions() { const { data } = await supabase.from("actions").select("*").order("created_at"); S.actions = (data || []).map(mapAction); }
-async function loadProfiles() { const { data } = await supabase.from("profiles").select("*").order("email"); S.profiles = data || []; S.me = S.profiles.find((p) => p.id === S.session.user.id) || S.me; }
+async function loadProfiles() { const { data } = await supabase.from("profiles").select("*").order("full_name"); S.profiles = data || []; S.me = S.profiles.find((p) => p.id === S.session.user.id) || S.me; }
 async function loadResults() {
   const w = S.week, pw = addDays(w, -7);
   const { data } = await supabase.from("results").select("*").in("week", [w, pw]);
@@ -126,16 +78,24 @@ async function loadResults() {
   S.results = cur; S.prev = prev;
 }
 async function loadReview() {
+  if (!["admin", "viewer"].includes(role())) { S.review = null; return; }
   const { data } = await supabase.from("reviews").select("*").eq("week", S.week).maybeSingle();
   S.review = data ? { ...data.data, at: data.created_at } : null;
 }
-async function loadAll() { await Promise.all([loadDepts(), loadProposals(), loadActions(), loadProfiles(), loadResults(), loadReview()]); }
+async function loadAdmin() {
+  if (!S.isAdmin) return;
+  const [{ data: st }, { data: jobs }] = await Promise.all([
+    supabase.from("app_settings").select("*").eq("id", 1).maybeSingle(),
+    supabase.from("job_runs").select("*").order("at", { ascending: false }).limit(15),
+  ]);
+  S.settings = st; S.jobs = jobs || [];
+}
+async function loadAll() { await Promise.all([loadDepts(), loadProposals(), loadActions(), loadProfiles(), loadResults(), loadReview(), loadAdmin()]); }
 
-// Live updates: reload the changed table, then redraw (unless someone is typing on the submit sheet)
 function subscribe() {
   if (S.channel) supabase.removeChannel(S.channel);
   const pending = new Set(); let t;
-  const loaders = { departments: loadDepts, kpis: loadDepts, proposals: loadProposals, actions: loadActions, results: loadResults, reviews: loadReview, profiles: loadProfiles };
+  const loaders = { departments: loadDepts, kpis: loadDepts, proposals: loadProposals, actions: loadActions, results: loadResults, reviews: loadReview, profiles: loadProfiles, job_runs: loadAdmin };
   S.channel = supabase.channel("kpi-live").on("postgres_changes", { event: "*", schema: "public" }, (p) => {
     pending.add(p.table); clearTimeout(t);
     t = setTimeout(async () => {
@@ -143,7 +103,7 @@ function subscribe() {
       await Promise.all(fns.map((f) => f()));
       if (S.tab === "submit" && S.formDirty) return;
       if (S.tab === "submit") S.form = null;
-      if (!S.aiBusy && !S.mdBusy) render();
+      if (!S.aiBusy && !S.mdBusy && !document.querySelector(".overlay")) render();
     }, 400);
   }).subscribe();
 }
@@ -159,31 +119,65 @@ async function run(promise, okMsg) {
 }
 const kpiRow = (deptId, i) => ({ id: i.id, dept_id: deptId, kra_no: i.kraNo, kra: i.kra || "", kra_weight: i.kraW || 0, no: i.no, text: i.text, target: i.target,
   tv: i.tv, dir: i.dir, freq: i.freq, owner: i.owner, star: !!i.star, updated_at: nowIso() });
+async function callFn(name, body) {
+  const { data, error } = await supabase.functions.invoke(name, { body });
+  if (error) {
+    let msg = error.message;
+    try { const j = await error.context.json(); msg = j.error || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  if (data && data.error) throw new Error(data.error);
+  return data;
+}
 
-/* ---------- auth screens ---------- */
-function showLogin(sent) {
+/* ---------- sign in: username + password (no email at all) ---------- */
+function showLogin() {
   $("#bar").hidden = true;
-  $("#main").innerHTML = `<div class="login"><form class="card" id="loginForm">
-    <div><span class="ai-tag" style="color:var(--gold)">Atlas Maharani Group</span><h1>Weekly KPI Review</h1></div>
-    ${sent ? `<div class="banner ok">Check your email for a sign-in link from the KPI Review app. Open it on this device.</div>` : `<p class="note">Sign in with your work email. We'll email you a sign-in link — no password needed.</p>`}
-    <label class="f">Work email<input class="inp" id="email" type="email" required autocomplete="email" value="${esc(LS.get("email", ""))}"></label>
-    <button class="btn primary" type="submit">${sent ? "Send the link again" : "Email me a sign-in link"}</button>
+  $("#main").innerHTML = `<div class="login"><form class="card" id="loginForm" novalidate>
+    <div><span class="ai-tag">Atlas Maharani Group</span><h1>Weekly KPI Review</h1></div>
+    <p class="note">Sign in with the username and password the admin gave you.</p>
+    <label class="f">Username<input class="inp" id="lid" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required value="${esc(LS.get("lid", ""))}" placeholder="e.g. jayan"></label>
+    <label class="f">Password<input class="inp" id="lpw" type="password" autocomplete="current-password" required></label>
+    <p class="note" id="lerr" role="alert" hidden></p>
+    <button class="btn primary" type="submit" id="lbtn">Sign in</button>
+    <p class="note">Forgot your password? Ask the admin to reset it.</p>
   </form></div>`;
   $("#loginForm").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const email = $("#email").value.trim(); LS.set("email", email);
-    const { error } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.origin } });
-    if (error) return toast(error.message);
-    showLogin(true);
+    const id = $("#lid").value.trim(), pw = $("#lpw").value, err = $("#lerr");
+    const username = normUsername(id);
+    if (!username) { err.textContent = id ? "Username has no spaces — letters and numbers only." : "Enter your username."; err.hidden = false; return; }
+    const email = userLogin(username);
+    if (!pw) { err.textContent = "Enter your password."; err.hidden = false; return; }
+    $("#lbtn").disabled = true; $("#lbtn").textContent = "Signing in…";
+    const { error } = await supabase.auth.signInWithPassword({ email, password: pw });
+    $("#lbtn").disabled = false; $("#lbtn").textContent = "Sign in";
+    if (error) { err.textContent = /invalid/i.test(error.message) ? "Username or password is wrong." : error.message; err.hidden = false; return; }
+    LS.set("lid", username);
   });
 }
 function showPending() {
   $("#bar").hidden = true;
   $("#main").innerHTML = `<div class="login"><div class="card"><h1>Waiting for access</h1>
-    <p>You're signed in as <b>${esc(S.session.user.email)}</b>. The admin needs to give you a role (HOD or viewer) before you can see the KPI review.</p>
+    <p>You're signed in, but the admin hasn't given you a role yet.</p>
     <p class="note">Once they do, this page opens by itself.</p>
     <button class="btn" id="out2">Sign out</button></div></div>`;
   $("#out2").onclick = () => supabase.auth.signOut();
+}
+function passwordModal() {
+  openModal(`<h2>Change my password</h2><div class="form-grid">
+    <label class="f wide">New password<input class="inp" id="np1" type="password" autocomplete="new-password" minlength="6"></label>
+    <label class="f wide">Type it again<input class="inp" id="np2" type="password" autocomplete="new-password"></label></div>
+    <div class="actions"><button class="btn" data-close>Cancel</button><button class="btn primary" id="npSave">Save password</button></div>`, (m) => {
+    m.querySelector("#npSave").onclick = async () => {
+      const a = m.querySelector("#np1").value, b = m.querySelector("#np2").value;
+      if (a.length < 6) return toast("Use at least 6 characters.");
+      if (a !== b) return toast("The two passwords don't match.");
+      const { error } = await supabase.auth.updateUser({ password: a });
+      if (error) return toast(error.message);
+      closeModal(); toast("Password changed");
+    };
+  });
 }
 
 /* ---------- header ---------- */
@@ -191,16 +185,18 @@ function renderHeader() {
   $("#bar").hidden = false;
   $("#wkMeet").textContent = "Meeting " + fmt(S.week);
   $("#wkRange").textContent = "Covers " + weekRange(S.week);
-  $("#usersTab").hidden = !S.isAdmin;
-  document.querySelectorAll("#tabs button").forEach((b) => b.setAttribute("aria-current", b.dataset.tab === S.tab ? "page" : "false"));
+  const allowed = TABS[role()] || [];
+  document.querySelectorAll("#tabs button").forEach((b) => { b.hidden = !allowed.includes(b.dataset.tab); b.setAttribute("aria-current", b.dataset.tab === S.tab ? "page" : "false"); });
+  $("#pptBtn").hidden = !["admin", "viewer"].includes(role());
   const deptName = S.me && S.me.dept_id && S.depts[S.me.dept_id] ? " · " + S.depts[S.me.dept_id].name : "";
-  $("#roleChip").textContent = (ROLES[S.me && S.me.role] || "") + (S.me && S.me.role === "hod" ? deptName : "");
+  $("#roleChip").textContent = (ROLES[role()] || "") + (role() === "hod" ? deptName : "");
 }
 $("#wkPrev").onclick = () => setWeek(addDays(S.week, -7));
 $("#wkNext").onclick = () => setWeek(addDays(S.week, 7));
 $("#tabs").addEventListener("click", (e) => { const b = e.target.closest("button[data-tab]"); if (!b) return; S.tab = b.dataset.tab; LS.set("tab", S.tab); render(); });
 $("#pptBtn").onclick = () => makePpt();
 $("#signOut").onclick = () => supabase.auth.signOut();
+$("#myPw").onclick = () => passwordModal();
 
 async function setWeek(w) {
   S.week = w; S.form = null; S.formDirty = false; S.results = {}; S.prev = {}; S.review = null; render();
@@ -213,17 +209,28 @@ function render() {
   renderHeader();
   const m = $("#main");
   if (!deptList().length) {
-    m.innerHTML = `<div class="empty">No departments yet. ${S.isAdmin ? `<br><br><button class="btn primary" data-act="add-dept">Add the first department</button>` : "The admin will add departments and their KRA &amp; KPI list."}</div>`;
+    m.innerHTML = `<div class="empty">${S.isAdmin ? `No departments yet.<br><br><button class="btn primary" data-act="add-dept">Add the first department</button>` : role() === "hod" ? "Your department isn't set yet. Ask the admin to set it in Users." : "No departments yet."}</div>`;
     return;
   }
-  if (hodLocked()) S.dept = S.me.dept_id;
+  if (hodLocked()) { S.dept = S.me.dept_id; S.masterDept = S.me.dept_id; S.weeklyDept = S.me.dept_id; }
   if (!S.depts[S.dept]) S.dept = deptList()[0].id;
   if (!S.depts[S.masterDept]) S.masterDept = deptList()[0].id;
-  if (S.tab === "users" && !S.isAdmin) S.tab = "overview";
-  const fn = { overview: vOverview, submit: vSubmit, weekly: vWeekly, master: vMaster, pending: vPending, md: vMD, users: vUsers }[S.tab] || vOverview;
+  const allowed = TABS[role()] || [];
+  if (!allowed.includes(S.tab)) S.tab = allowed[0];
+  const fn = { overview: vOverview, submit: vSubmit, weekly: vWeekly, master: vMaster, pending: vPending, md: vMD, users: vUsers, settings: vSettings }[S.tab] || vOverview;
+  renderHeader();
   m.innerHTML = fn();
+  labelTables(m);
   if (S.tab === "submit") bindSubmit();
 }
+/* On phones, tables marked .resp become cards: copy each column heading onto its cells. */
+function labelTables(root) {
+  root.querySelectorAll("table.resp").forEach((t) => {
+    const heads = [...t.querySelectorAll("thead th")].map((th) => th.dataset.label ?? th.textContent.trim());
+    t.querySelectorAll("tbody tr").forEach((tr) => [...tr.children].forEach((td, i) => { if (!td.hasAttribute("data-label") && heads[i]) td.setAttribute("data-label", heads[i]); }));
+  });
+}
+const viaBadge = (r) => (r && r.source === "whatsapp" ? ` <span class="pill wa">via WhatsApp</span>` : "");
 
 /* Overview */
 function vOverview() {
@@ -239,7 +246,7 @@ function vOverview() {
     return `<button class="dcard ${submitted ? sm.rag : "none"}" data-act="goto-submit" data-dept="${d.id}">
       <div class="top"><h3>${esc(d.name)}</h3>${submitted ? `<span class="pill ${sm.rag}">${RAGN[sm.rag] || "—"}</span>` : r ? `<span class="pill none">Draft</span>` : `<span class="pill none">Not submitted</span>`}</div>
       <div class="top"><span class="score">${sm.score != null ? sm.score + "%" : "—"}</span><span class="meta">${esc(trend)}</span></div>
-      <div class="rag-row"><span class="pill G">${sm.counts.G} G</span><span class="pill A">${sm.counts.A} A</span><span class="pill R">${sm.counts.R} R</span><span class="pill none">${open} open actions</span></div>
+      <div class="rag-row"><span class="pill G">${sm.counts.G} G</span><span class="pill A">${sm.counts.A} A</span><span class="pill R">${sm.counts.R} R</span><span class="pill none">${open} open actions</span>${viaBadge(r)}</div>
       ${r && r.ai ? `<div class="meta">Claude: <span class="pill ${RATINGS[r.ai.rating] || "none"}">${esc(r.ai.rating)}</span>${r.ai.score != null ? ` · evidence ${esc(r.ai.score)}/100` : ""}</div>` : ""}
       <div class="meta">HOD: ${esc(d.hod || "—")}${r && r.at ? ` · ${r.status === "submitted" ? "Submitted" : "Saved"} ${esc(when(r.at))}` : ""}</div>
     </button>`;
@@ -247,7 +254,7 @@ function vOverview() {
   const grp = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
   const overdue = S.actions.filter((a) => a.status !== "Done" && a.due && a.due < today()).length;
   return `<section class="panel">
-    <div class="head-row"><div><h2>Week ${esc(weekRange(S.week))}</h2><p class="sub">Monday HOD meeting on ${esc(fmt(S.week))}. Scores are average achievement of the KPIs each HOD reported.</p></div>
+    <div class="head-row"><div><h2>Week ${esc(weekRange(S.week))}</h2><p class="sub">Monday HOD meeting on ${esc(fmt(S.week))}. Reports close Saturday; the PPT goes to WhatsApp at 5 PM.</p></div>
     <button class="btn primary" data-act="ppt">Make PPT for this week</button></div>
     <div class="stats">
       <div class="stat"><b>${sub}/${ds.length}</b><span>Submitted</span></div>
@@ -262,11 +269,6 @@ function vOverview() {
 }
 
 /* Submit */
-function itemsFor(deptId, all) {
-  const d = S.depts[deptId]; if (!d) return [];
-  return (d.items || []).filter((i) => all || WEEKLY.has(i.freq)).slice()
-    .sort((a, b) => (b.star ? 1 : 0) - (a.star ? 1 : 0) || a.kraNo - b.kraNo || String(a.no).localeCompare(String(b.no), undefined, { numeric: true }));
-}
 function ensureForm() {
   const key = S.week + "__" + S.dept;
   if (S.form && S.form.key === key) return S.form;
@@ -279,25 +281,21 @@ function ensureForm() {
   S.formDirty = false;
   return S.form;
 }
-const mayEditDept = (id) => S.isAdmin || (S.me && S.me.role === "hod" && S.me.dept_id === id);
 function vSubmit() {
   const ds = deptList(); const d = S.depts[S.dept]; const f = ensureForm(); const r = S.results[S.dept];
   const editable = mayEditDept(S.dept);
   const all = S.showAll || Object.keys(f.rows).some((id) => !WEEKLY.has(((d.items || []).find((i) => i.id === id) || {}).freq) && (f.rows[id].actual || f.rows[id].rag));
-  const items = itemsFor(S.dept, all);
+  const items = itemsFor(d, all);
   const dis = editable ? "" : "disabled";
   const rowsHtml = items.map((i) => {
     const row = f.rows[i.id] || {};
     const ach = row.ach != null ? row.ach : null; const rag = row.rag || ragOf(ach);
-    const manual = i.tv == null && i.dir !== "zero";
+    const manual = isManual(i);
     return `<tr data-id="${esc(i.id)}">
-      <td class="star" title="${i.star ? "Headline KPI" : ""}">${i.star ? "★" : ""}</td>
-      <td class="no">${esc(i.no)}</td>
-      <td class="kpi">${esc(i.text)}<div class="who">${esc(i.owner)}</div></td>
-      <td>${esc(i.target)} <span class="freq">${esc(i.freq)}</span></td>
-      <td><input class="inp num" data-f="actual" aria-label="Actual for ${esc(i.no)}" value="${esc(row.actual ?? "")}" placeholder="${manual ? "value" : "actual"}" ${dis}></td>
-      <td>${manual ? `<input class="inp num" data-f="ach" aria-label="Achievement % for ${esc(i.no)}" value="${esc(ach ?? "")}" placeholder="%" ${dis}>` : `<span class="ach" data-out="ach">${ach != null ? ach + "%" : "—"}</span>`}</td>
-      <td><select class="inp" data-f="rag" aria-label="Status for ${esc(i.no)}" style="min-width:128px" ${dis}>
+      <td class="kpi" data-label=""><span class="no">${i.star ? '<span class="star" title="Headline KPI">★</span> ' : ""}${esc(i.no)}</span> ${esc(i.text)}<div class="who">${esc(i.owner)} · target ${esc(i.target)} <span class="freq">${esc(i.freq)}</span></div></td>
+      <td><input class="inp num" data-f="actual" inputmode="decimal" aria-label="Actual for ${esc(i.no)}" value="${esc(row.actual ?? "")}" placeholder="${manual ? "value" : "actual"}" ${dis}></td>
+      <td>${manual ? `<input class="inp num" data-f="ach" inputmode="decimal" aria-label="Achievement % for ${esc(i.no)}" value="${esc(ach ?? "")}" placeholder="%" ${dis}>` : `<span class="ach" data-out="ach">${ach != null ? ach + "%" : "—"}</span>`}</td>
+      <td><select class="inp" data-f="rag" aria-label="Status for ${esc(i.no)}" ${dis}>
         <option value="">${rag && !row.rag ? "Auto: " + RAGN[rag] : "Auto"}</option>
         ${["G", "A", "R", "NA"].map((k) => `<option value="${k}" ${row.rag === k ? "selected" : ""}>${RAGN[k]}</option>`).join("")}
       </select></td>
@@ -306,22 +304,23 @@ function vSubmit() {
     </tr>`;
   }).join("");
   const open = S.actions.filter((a) => a.dept === S.dept && a.status !== "Done");
-  const actHtml = open.length ? `<div class="tbl-wrap"><table><thead><tr><th>Action</th><th>Owner</th><th>Due</th><th>Status</th><th>Result</th></tr></thead><tbody>
+  const actHtml = open.length ? `<div class="tbl-wrap"><table class="resp"><thead><tr><th>Action</th><th>Owner</th><th>Due</th><th>Status</th><th>Result</th></tr></thead><tbody>
     ${open.map((a) => `<tr><td class="kpi">${esc(a.action)}<div class="who">${esc(a.kpiNo ? "KPI " + a.kpiNo : "")}</div></td><td>${esc(a.owner)}</td>
       <td class="${a.due && a.due < today() ? "overdue" : ""}">${a.due ? esc(fmtShort(a.due)) : "—"}</td>
       <td><select class="inp" data-act-status="${esc(a._id)}" ${dis}>${["Open", "In progress", "Done", "Not done"].map((s) => `<option ${a.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></td>
       <td><input class="inp" data-act-result="${esc(a._id)}" value="${esc(a.result || "")}" placeholder="Result shown" ${dis}></td></tr>`).join("")}
     </tbody></table></div>` : `<p class="note">No open actions for ${esc(d.name)}.</p>`;
-  const kpiOpts = itemsFor(S.dept, true).map((i) => `<option value="${esc(i.id)}">${esc(i.no)} · ${esc(i.text.slice(0, 60))}</option>`).join("");
+  const kpiOpts = itemsFor(d, true).map((i) => `<option value="${esc(i.id)}">${esc(i.no)} · ${esc(i.text.slice(0, 60))}</option>`).join("");
   const naHtml = f.newActions.map((a, ix) => `<tr><td>${esc(a.kpiNo)}</td><td class="kpi">${esc(a.action)}</td><td>${esc(a.owner)}</td><td>${a.due ? esc(fmtShort(a.due)) : "—"}</td><td><button class="btn small ghost danger" data-act="rm-new" data-ix="${ix}">Remove</button></td></tr>`).join("");
-  const chips = hodLocked() ? "" : `<div class="chips" role="group" aria-label="Department">${ds.map((x) => `<button class="chip" data-act="set-dept" data-dept="${x.id}" aria-pressed="${x.id === S.dept}">${esc(x.name)}</button>`).join("")}</div>`;
+  const chips = hodLocked() || ds.length < 2 ? "" : `<div class="chips" role="group" aria-label="Department">${ds.map((x) => `<button class="chip" data-act="set-dept" data-dept="${x.id}" aria-pressed="${x.id === S.dept}">${esc(x.name)}</button>`).join("")}</div>`;
   return `<section class="panel">
-    <div class="head-row"><div><h2>Submit results</h2><p class="sub">${esc(d.name)} · week ${esc(weekRange(S.week))} · HOD ${esc(d.hod || "")}</p></div>${chips}</div>
+    <div class="head-row"><div><h2>${role() === "hod" ? "My KPI results" : "Submit results"}</h2><p class="sub">${esc(d.name)} · week ${esc(weekRange(S.week))} · HOD ${esc(d.hod || "")}</p></div>${chips}</div>
     ${!editable ? `<div class="banner">You can view this sheet. Only ${esc(d.name)}'s HOD or an admin can change it.</div>` : ""}
-    ${r ? `<div class="banner ${r.status === "submitted" ? "ok" : ""}">${r.status === "submitted" ? "Submitted" : "Draft saved"} by ${esc(nameOf(r.by))} on ${esc(new Date(r.at).toLocaleString("en-IN"))}.${editable ? " You can still correct it before the meeting." : ""}</div>` : ""}
-    <div class="toolbar"><span class="note grow">Enter the week's actual figure. Achievement % and status fill in automatically; pick a status yourself where there is no number. Rows with ★ are headline KPIs.</span>
+    ${r ? `<div class="banner ${r.status === "submitted" ? "ok" : ""}">${r.status === "submitted" ? "Submitted" : "Draft saved"}${r.source === "whatsapp" ? " on WhatsApp" : ""} by ${esc(nameOf(r.by))} on ${esc(new Date(r.at).toLocaleString("en-IN"))}.${editable ? " You can still correct it before Saturday 5 PM." : ""}</div>` : ""}
+    ${role() === "hod" ? `<p class="note">You can also send your KPIs on WhatsApp: message <b>START</b> to the company KPI number.</p>` : ""}
+    <div class="toolbar"><span class="note grow">Enter the week's actual figure. Achievement % and status fill in automatically; pick a status yourself where there is no number. ★ = headline KPI.</span>
       <label class="note"><input type="checkbox" id="showAll" ${S.showAll ? "checked" : ""}> Show monthly &amp; other KPIs</label></div>
-    <div class="tbl-wrap"><table id="resTbl"><thead><tr><th></th><th>#</th><th>KPI</th><th>Target</th><th>Actual</th><th>Ach %</th><th>Status</th><th>Reason / remarks</th><th>Supporting data</th></tr></thead><tbody>${rowsHtml || `<tr><td colspan="9" class="note">No weekly KPIs. Tick “Show monthly &amp; other KPIs”.</td></tr>`}</tbody></table></div>
+    <div class="tbl-wrap"><table id="resTbl" class="resp sheet"><thead><tr><th data-label="">KPI</th><th>Actual</th><th>Ach %</th><th>Status</th><th>Reason / remarks</th><th>Supporting data</th></tr></thead><tbody>${rowsHtml || `<tr><td colspan="6" class="note">No weekly KPIs. Tick “Show monthly &amp; other KPIs”.</td></tr>`}</tbody></table></div>
   </section>
   <section class="two">
     <div class="panel"><h3>Last week's actions</h3><p class="note">Update each open action. Changes save straight away.</p>${actHtml}</div>
@@ -332,7 +331,7 @@ function vSubmit() {
   </section>
   ${editable ? `<section class="panel">
     <div class="head-row"><div><h3>New actions for Red KPIs</h3><p class="sub">Added to Pending points when you submit.</p></div></div>
-    ${naHtml ? `<div class="tbl-wrap"><table><thead><tr><th>KPI</th><th>Action</th><th>Owner</th><th>Due</th><th></th></tr></thead><tbody>${naHtml}</tbody></table></div>` : ""}
+    ${naHtml ? `<div class="tbl-wrap"><table class="resp"><thead><tr><th>KPI</th><th>Action</th><th>Owner</th><th>Due</th><th></th></tr></thead><tbody>${naHtml}</tbody></table></div>` : ""}
     <div class="form-grid">
       <label class="f">KPI<select class="inp" id="naKpi"><option value="">General</option>${kpiOpts}</select></label>
       <label class="f wide">Action<input class="inp" id="naText" placeholder="What will be done"></label>
@@ -342,7 +341,7 @@ function vSubmit() {
     <div><button class="btn" data-act="add-new">Add action</button></div>
   </section>` : ""}
   ${aiPanel(editable)}
-  ${editable ? `<div class="toolbar"><span class="grow note" id="dirtyNote">${S.formDirty ? "Unsaved changes" : ""}</span>
+  ${editable ? `<div class="toolbar savebar"><span class="grow note" id="dirtyNote">${S.formDirty ? "Unsaved changes" : ""}</span>
     <button class="btn" data-act="save-draft">Save draft</button>
     <button class="btn primary" data-act="submit">Submit results</button></div>` : ""}`;
 }
@@ -356,7 +355,7 @@ function bindSubmit() {
     const fld = e.target.dataset.f; if (!fld) return;
     if (fld === "ach") { const v = parseFloat(e.target.value); row.ach = isNaN(v) ? null : Math.min(Math.round(v), 120); }
     else row[fld] = e.target.value;
-    if (fld === "actual" && !(item.tv == null && item.dir !== "zero")) {
+    if (fld === "actual" && !isManual(item)) {
       row.ach = calcAch(item, row.actual);
       const o = tr.querySelector('[data-out="ach"]'); if (o) o.textContent = row.ach != null ? row.ach + "%" : "—";
     }
@@ -392,7 +391,7 @@ async function saveResult(status) {
   const sm = summarize(rows);
   const ok = await run(supabase.from("results").upsert({
     week: S.week, dept_id: S.dept, status, rows, priorities: f.priorities, support: f.support, score: sm.score, counts: sm.counts,
-    ai: f.ai || null, clar: f.clar || [], updated_by: S.session.user.id, updated_at: nowIso(),
+    ai: f.ai || null, clar: f.clar || [], source: "app", updated_by: S.session.user.id, updated_at: nowIso(),
   }, { onConflict: "week,dept_id" }), status === "submitted" ? `${d.name} results submitted` : "Draft saved");
   if (!ok) return;
   if (status === "submitted" && f.newActions.length) {
@@ -406,28 +405,7 @@ async function updateAction(id, patch) {
   if (ok) await loadActions();
 }
 
-/* ---------- Claude (via Supabase Edge Functions; the API key never reaches the browser) ---------- */
-async function callFn(name, body) {
-  const { data, error } = await supabase.functions.invoke(name, { body });
-  if (error) {
-    let msg = error.message;
-    try { const j = await error.context.json(); msg = j.error || msg; } catch (e) {}
-    throw new Error(msg);
-  }
-  if (data && data.error) throw new Error(data.error);
-  return data;
-}
-function rowsHash(rows) {
-  return Object.keys(rows || {}).sort().map((k) => { const r = rows[k]; return [k, r.actual ?? "", r.ach ?? "", r.rag || "", r.reason || "", r.data || ""].join("|"); }).join("~");
-}
-function aiRowsFor(deptId, rows) {
-  const out = [];
-  for (const i of S.depts[deptId].items || []) {
-    const r = rows[i.id]; if (!r || !(r.actual || r.rag || r.reason || r.data || r.ach != null)) continue;
-    out.push({ no: i.no, kpi: i.text, target: i.target, freq: FREQ[i.freq] || i.freq, headline: !!i.star, actual: r.actual || "", achievement: r.ach != null ? r.ach + "%" : "", status: RAGN[r.rag || ragOf(r.ach)] || "", reason: r.reason || "", data: r.data || "" });
-  }
-  return out;
-}
+/* ---------- Claude check (questions in Malayalam) ---------- */
 function aiPanel(editable) {
   const f = S.form; const ai = f.ai;
   if (!ai && !editable) return "";
@@ -437,34 +415,33 @@ function aiPanel(editable) {
   const dis = editable ? "" : "disabled";
   return `<section class="panel ai" id="aiPanel">
     <div class="head-row"><div><span class="ai-tag">Claude check</span><h3>Is this sheet result-oriented?</h3>
-      <p class="sub">Claude reads your figures before the MD office does: it flags work reported as duty instead of results, asks for data behind each claim, and suggests improvements. Answer its questions, then submit.</p></div>
+      <p class="sub">Claude reads your figures before the MD office does, asks for data behind each claim (in Malayalam), and suggests improvements. Answer its questions, then submit.</p></div>
       ${editable ? `<div class="toolbar"><button class="btn primary" data-act="ai-check" ${S.aiBusy ? "disabled" : ""}>${ai ? "Check again with Claude" : "Check with Claude"}</button></div>` : ""}</div>
     ${S.aiBusy ? `<div class="thinking">Claude is reading ${esc(S.depts[S.dept].name)}'s results… this takes up to a minute.</div>` : ""}
     ${ai ? `
       ${changed ? `<div class="banner">Figures changed after this check. Check again before submitting.</div>` : ""}
-      <div class="toolbar"><span class="pill ${RATINGS[ai.rating] || "none"}">${esc(ai.rating || "—")}</span><b>Evidence score ${ai.score != null ? esc(ai.score) + "/100" : "—"}</b><span class="note">checked ${esc(when(ai.at))}</span></div>
-      <p style="margin:0">${esc(ai.summary || "")}</p>
+      <div class="toolbar"><span class="pill ${RATINGS[ai.rating] || "none"}">${esc(ai.rating || "—")}</span><span class="ml">${esc(RATING_ML[ai.rating] || "")}</span><b>Evidence ${ai.score != null ? esc(ai.score) + "/100" : "—"}</b><span class="note">checked ${esc(when(ai.at))}</span></div>
+      <p class="ml" style="margin:0">${esc(ai.summary || "")}</p>
       ${flags.length ? `<h3>Questions to clarify ${openQ ? `<span class="pill R">${openQ} must answer</span>` : `<span class="pill G">All key questions answered</span>`}</h3>
-        <div class="flags">${flags.map((x, ix) => `<div class="flag ${esc(x.severity)}"><div class="toolbar"><span class="freq">${x.kpiNo ? "KPI " + esc(x.kpiNo) : "General"}</span><span class="note">${esc(x.issue || "")}</span></div>
-          <div class="q">${esc(x.question)}</div>
-          <textarea class="inp" data-ai-ans="${ix}" rows="2" aria-label="Your answer" placeholder="${x.severity === "high" ? "Answer required before submitting" : "Your answer"}" ${dis}>${esc(x.answer || "")}</textarea></div>`).join("")}</div>` : `<p class="note">No questions. Claude found the sheet clear.</p>`}
-      ${(ai.suggestions || []).length ? `<h3>Suggestions</h3><ul style="margin:0;padding-left:18px">${ai.suggestions.map((s) => `<li>${esc(s)}</li>`).join("")}</ul>` : ""}
-      ${f.clar.length ? `<details><summary class="note">Earlier answers (${f.clar.length})</summary><div class="flags" style="margin-top:8px">${f.clar.map((c) => `<div class="qa"><b>${c.kpiNo ? "KPI " + esc(c.kpiNo) + ": " : ""}${esc(c.question)}</b>${esc(c.answer)}</div>`).join("")}</div></details>` : ""}
+        <div class="flags">${flags.map((x, ix) => `<div class="flag ${esc(x.severity)}"><div class="toolbar"><span class="freq">${x.kpiNo ? "KPI " + esc(x.kpiNo) : "General"}</span><span class="note ml">${esc(x.issue || "")}</span></div>
+          <div class="q ml">${esc(x.question)}</div>
+          <textarea class="inp" data-ai-ans="${ix}" rows="2" aria-label="Your answer" placeholder="${x.severity === "high" ? "മറുപടി നിർബന്ധം · answer required" : "നിങ്ങളുടെ മറുപടി"}" ${dis}>${esc(x.answer || "")}</textarea></div>`).join("")}</div>` : `<p class="note">No questions. Claude found the sheet clear.</p>`}
+      ${(ai.suggestions || []).length ? `<h3>Suggestions</h3><ul class="ml" style="margin:0;padding-left:18px">${ai.suggestions.map((s) => `<li>${esc(s)}</li>`).join("")}</ul>` : ""}
+      ${f.clar.length ? `<details><summary class="note">Earlier answers (${f.clar.length})</summary><div class="flags" style="margin-top:8px">${f.clar.map((c) => `<div class="qa ml"><b>${c.kpiNo ? "KPI " + esc(c.kpiNo) + ": " : ""}${esc(c.question)}</b>${esc(c.answer)}</div>`).join("")}</div></details>` : ""}
     ` : `<p class="note">Not checked yet.</p>`}
   </section>`;
 }
 async function runCheck() {
   const f = S.form; const d = S.depts[S.dept];
-  const rows = aiRowsFor(S.dept, f.rows);
+  const rows = checkRows(d, f.rows);
   if (!rows.length) return toast("Enter your results first, then ask Claude to check them.");
   if (f.ai && f.ai.flags) for (const x of f.ai.flags) {
     if ((x.answer || "").trim() && !f.clar.some((c) => c.question === x.question)) f.clar.push({ kpiNo: x.kpiNo || "", question: x.question, answer: x.answer.trim(), at: nowIso() });
   }
-  const missing = (d.items || []).filter((i) => i.star && WEEKLY.has(i.freq) && !rows.some((r) => r.no === i.no)).map((i) => `${i.no} ${i.text}`);
   S.aiBusy = true; render();
   try {
     const res = await callFn("ai-check", {
-      deptId: S.dept, deptName: d.name, hod: d.hod, week: weekRange(S.week), meeting: fmt(S.week), rows, missing,
+      deptId: S.dept, deptName: d.name, hod: d.hod, week: weekRange(S.week), meeting: fmt(S.week), rows, missing: missingHeadline(d, f.rows),
       priorities: f.priorities.filter(Boolean), support: f.support || "", clarifications: f.clar.map((c) => ({ kpi: c.kpiNo, q: c.question, a: c.answer })),
     });
     f.ai = { ...res, at: nowIso(), hash: rowsHash(f.rows), flags: (res.flags || []).map((x) => ({ ...x, answer: "" })) };
@@ -473,24 +450,16 @@ async function runCheck() {
   finally { S.aiBusy = false; render(); const p = $("#aiPanel"); p && p.scrollIntoView({ block: "start", behavior: "smooth" }); }
 }
 
-/* MD office */
-function repeatReds() {
-  const out = [];
-  deptList().forEach((d) => {
-    const r = S.results[d.id], p = S.prev[d.id]; if (!r || !p) return;
-    for (const [id, x] of Object.entries(r.rows || {})) { const y = (p.rows || {})[id]; if (y && (x.rag || ragOf(x.ach)) === "R" && (y.rag || ragOf(y.ach)) === "R") out.push({ dept: d.id, name: d.name, no: x.no, text: x.text }); }
-  });
-  return out;
-}
+/* ---------- MD office ---------- */
 function vMD() {
-  const ds = deptList(); const rv = S.review; const t = today(); const rr = repeatReds();
+  const ds = deptList(); const rv = S.review; const t = today(); const rr = repeatReds(S.depts, S.results, S.prev);
   const rows = ds.map((d) => {
     const r = S.results[d.id]; const subm = r && r.status === "submitted"; const sm = r ? summarize(r.rows) : null; const ai = r && r.ai;
     const unanswered = ai ? (ai.flags || []).filter((x) => !(x.answer || "").trim()).length : 0;
     const answered = (r && r.clar ? r.clar.length : 0) + (ai ? (ai.flags || []).filter((x) => (x.answer || "").trim()).length : 0);
     const od = S.actions.filter((a) => a.dept === d.id && a.status !== "Done" && a.due && a.due < t).length;
     return `<tr><td><b>${esc(d.name)}</b><div class="who">${esc(d.hod || "")}</div></td>
-      <td>${subm ? `<span class="pill G">Submitted</span>` : r ? `<span class="pill A">Draft</span>` : `<span class="pill R">Missing</span>`}</td>
+      <td>${subm ? `<span class="pill G">Submitted</span>` : r ? `<span class="pill A">Draft</span>` : `<span class="pill R">Missing</span>`}${viaBadge(r)}</td>
       <td>${sm && sm.score != null ? `<span class="pill ${sm.rag}">${sm.score}%</span>` : "—"}</td>
       <td>${ai ? `<span class="pill ${RATINGS[ai.rating] || "none"}">${esc(ai.rating)}</span>` : `<span class="note">Not checked</span>`}</td>
       <td>${ai && ai.score != null ? esc(ai.score) + "/100" : "—"}</td>
@@ -502,16 +471,16 @@ function vMD() {
     const r = S.results[d.id]; if (!r) return "";
     const qa = [...(r.clar || []), ...((r.ai && r.ai.flags) || []).map((x) => ({ kpiNo: x.kpiNo, question: x.question, answer: x.answer }))];
     if (!qa.length) return "";
-    return `<div class="rv-dept"><h3>${esc(d.name)}</h3><div class="flags">${qa.map((c) => `<div class="qa"><b>${c.kpiNo ? "KPI " + esc(c.kpiNo) + ": " : ""}${esc(c.question)}</b>${(c.answer || "").trim() ? esc(c.answer) : `<span class="overdue">Not answered</span>`}</div>`).join("")}</div></div>`;
+    return `<div class="rv-dept"><h3>${esc(d.name)}</h3><div class="flags">${qa.map((c) => `<div class="qa ml"><b>${c.kpiNo ? "KPI " + esc(c.kpiNo) + ": " : ""}${esc(c.question)}</b>${(c.answer || "").trim() ? esc(c.answer) : `<span class="overdue">Not answered</span>`}</div>`).join("")}</div></div>`;
   }).join("");
   return `<section class="panel">
     <div class="head-row"><div><h2>MD Office monitoring</h2><p class="sub">Week ${esc(weekRange(S.week))}. How each department reported: results or just duty, whether the data backs the claims, and what Claude asked them to clarify.</p></div></div>
-    <div class="tbl-wrap"><table><thead><tr><th>Department</th><th>Sheet</th><th>KPI score</th><th>Claude rating</th><th>Evidence</th><th>Clarified</th><th>Overdue actions</th><th>Red 2 weeks</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="tbl-wrap"><table class="resp"><thead><tr><th>Department</th><th>Sheet</th><th>KPI score</th><th>Claude rating</th><th>Evidence</th><th>Clarified</th><th>Overdue actions</th><th>Red 2 weeks</th></tr></thead><tbody>${rows}</tbody></table></div>
     ${rr.length ? `<div class="banner"><b>Red two weeks running:</b> ${rr.map((x) => `${esc(x.name)} ${esc(x.no)} (${esc(x.text)})`).join(" · ")}</div>` : ""}
   </section>
   <section class="panel ai">
     <div class="head-row"><div><span class="ai-tag">Claude review for the MD office</span><h3>Weekly review and questions for Monday</h3>
-      <p class="sub">Claude reads every submitted sheet, the HODs' answers, last week's scores and the action tracker, then writes the MD office's view.</p></div>
+      <p class="sub">Runs by itself every Saturday at 4:30 PM, before the 5 PM PPT. You can also run it now.</p></div>
       <div class="toolbar"><button class="btn primary" data-act="md-review" ${S.isAdmin && !S.mdBusy ? "" : "disabled"}>${rv ? "Run review again" : "Generate MD review"}</button></div></div>
     ${!S.isAdmin ? `<p class="note">Only admins (MD office) can generate the review.</p>` : ""}
     ${S.mdBusy ? `<div class="thinking">Claude is reviewing all departments… this can take one to two minutes.</div>` : ""}
@@ -532,69 +501,54 @@ function mdReviewHtml(rv) {
     ${(rv.crossDept || []).length ? `<div class="rv-dept"><h3>Across departments</h3><ul>${rv.crossDept.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>` : ""}`;
 }
 async function runMdReview() {
-  const ds = deptList(); const t = today();
-  const depts = ds.map((d) => {
-    const r = S.results[d.id]; const p = S.prev[d.id];
-    return {
-      id: d.id, name: d.name, hod: d.hod, sheet: r ? r.status : "missing", score: r ? summarize(r.rows).score : null, lastWeekScore: p ? summarize(p.rows).score : null,
-      claudeCheck: r && r.ai ? { rating: r.ai.rating, evidenceScore: r.ai.score, summary: r.ai.summary } : null,
-      rows: r ? Object.values(r.rows || {}).map((x) => ({ no: x.no, kpi: x.text, target: x.target, actual: x.actual, ach: x.ach, status: RAGN[x.rag || ragOf(x.ach)] || "", reason: x.reason, data: x.data })) : [],
-      clarifications: r ? [...(r.clar || []), ...((r.ai && r.ai.flags) || [])].map((c) => ({ kpi: c.kpiNo, q: c.question, a: c.answer || "NOT ANSWERED" })) : [],
-      priorities: r ? (r.priorities || []).filter(Boolean) : [], support: r ? r.support : "",
-      openActions: S.actions.filter((a) => a.dept === d.id && a.status !== "Done").map((a) => ({ action: a.action, owner: a.owner, due: a.due, overdue: !!(a.due && a.due < t), status: a.status })),
-    };
-  });
   S.mdBusy = true; render();
-  try {
-    await callFn("ai-review", { week: S.week, weekLabel: weekRange(S.week), meeting: fmt(S.week), repeatReds: repeatReds().map((x) => `${x.name} ${x.no} ${x.text}`), departments: depts });
-    await loadReview(); toast("MD review saved");
-  } catch (e) { toast("Claude review failed: " + e.message); }
+  try { await callFn("ai-review", { week: S.week }); await loadReview(); toast("MD review saved"); }
+  catch (e) { toast("Claude review failed: " + e.message); }
   finally { S.mdBusy = false; render(); }
 }
 
-/* Weekly list */
+/* ---------- weekly list & master ---------- */
 function vWeekly() {
   const ds = deptList();
-  const show = S.weeklyDept === "all" ? ds : ds.filter((d) => d.id === S.weeklyDept);
+  const show = S.weeklyDept === "all" || !S.depts[S.weeklyDept] ? ds : ds.filter((d) => d.id === S.weeklyDept);
   const body = show.map((d) => {
-    const items = itemsFor(d.id, false);
+    const items = itemsFor(d, false);
     return `<section class="panel"><div class="head-row"><div><h3>${esc(d.name)}</h3><p class="sub">HOD ${esc(d.hod || "")} · ${items.length} weekly KPIs, ${items.filter((i) => i.star).length} headline</p></div></div>
-      <div class="tbl-wrap"><table><thead><tr><th></th><th>#</th><th>KPI</th><th>Target</th><th>Freq</th><th>Owner</th></tr></thead><tbody>
-      ${items.map((i) => `<tr><td class="star">${i.star ? "★" : ""}</td><td class="no">${esc(i.no)}</td><td class="kpi">${esc(i.text)}</td><td>${esc(i.target)}</td><td><span class="freq">${esc(FREQ[i.freq] || i.freq)}</span></td><td>${esc(i.owner)}</td></tr>`).join("") || `<tr><td colspan="6" class="note">No daily or weekly KPIs.</td></tr>`}
+      <div class="tbl-wrap"><table class="resp"><thead><tr><th data-label="">KPI</th><th>Target</th><th>Freq</th><th>Owner</th></tr></thead><tbody>
+      ${items.map((i) => `<tr><td class="kpi" data-label=""><span class="no">${i.star ? '<span class="star">★</span> ' : ""}${esc(i.no)}</span> ${esc(i.text)}</td><td>${esc(i.target)}</td><td><span class="freq">${esc(FREQ[i.freq] || i.freq)}</span></td><td>${esc(i.owner)}</td></tr>`).join("") || `<tr><td colspan="4" class="note">No daily or weekly KPIs.</td></tr>`}
       </tbody></table></div></section>`;
   }).join("");
-  return `<section class="panel"><div class="head-row"><div><h2>Weekly KPI list</h2><p class="sub">Daily, weekly and 15-day KPIs reviewed every Monday. ★ headline KPIs go on the scorecard; others are mentioned only if Amber or Red.</p></div></div>
-    <div class="chips" role="group" aria-label="Department"><button class="chip" data-act="wdept" data-dept="all" aria-pressed="${S.weeklyDept === "all"}">All departments</button>${ds.map((x) => `<button class="chip" data-act="wdept" data-dept="${x.id}" aria-pressed="${x.id === S.weeklyDept}">${esc(x.name)}</button>`).join("")}</div></section>${body}`;
+  const chips = ds.length < 2 ? "" : `<div class="chips" role="group" aria-label="Department"><button class="chip" data-act="wdept" data-dept="all" aria-pressed="${S.weeklyDept === "all"}">All departments</button>${ds.map((x) => `<button class="chip" data-act="wdept" data-dept="${x.id}" aria-pressed="${x.id === S.weeklyDept}">${esc(x.name)}</button>`).join("")}</div>`;
+  return `<section class="panel"><div class="head-row"><div><h2>Weekly KPI list</h2><p class="sub">Daily, weekly and 15-day KPIs reviewed every week. These are the KPIs the WhatsApp bot asks on Saturday. ★ = headline KPI.</p></div></div>${chips}</section>${body}`;
 }
-
-/* Master list */
 function vMaster() {
   const ds = deptList(); const d = S.depts[S.masterDept]; const q = S.q.trim().toLowerCase();
   const items = (d.items || []).filter((i) => !q || (i.text + " " + i.owner + " " + i.no + " " + i.kra).toLowerCase().includes(q));
   const kras = [...new Map(items.map((i) => [i.kraNo, { no: i.kraNo, name: i.kra, w: i.kraW }])).values()].sort((a, b) => a.no - b.no);
-  const canPropose = S.me && ["admin", "hod"].includes(S.me.role);
-  const rows = kras.map((k) => `<tr class="kra-row"><td colspan="${S.isAdmin ? 7 : 6}">KRA ${k.no || ""} · ${esc(k.name)}${k.w ? ` · ${k.w}%` : ""}</td></tr>` +
+  const canPropose = ["admin", "hod"].includes(role());
+  const rows = kras.map((k) => `<tr class="kra-row"><td colspan="${S.isAdmin ? 5 : 4}">KRA ${k.no || ""} · ${esc(k.name)}${k.w ? ` · ${k.w}%` : ""}</td></tr>` +
     items.filter((i) => i.kraNo === k.no).sort((a, b) => String(a.no).localeCompare(String(b.no), undefined, { numeric: true })).map((i) => `<tr>
-      <td class="star">${i.star ? "★" : ""}</td><td class="no">${esc(i.no)}</td><td class="kpi">${esc(i.text)}</td><td>${esc(i.target)}</td>
+      <td class="kpi" data-label=""><span class="no">${i.star ? '<span class="star">★</span> ' : ""}${esc(i.no)}</span> ${esc(i.text)}</td><td>${esc(i.target)}</td>
       <td><span class="freq">${esc(FREQ[i.freq] || i.freq)}</span></td><td>${esc(i.owner)}</td>
-      ${S.isAdmin ? `<td style="white-space:nowrap"><button class="btn small" data-act="edit-kpi" data-id="${esc(i.id)}">Edit</button> <button class="btn small ghost danger" data-act="del-kpi" data-id="${esc(i.id)}">Delete</button></td>` : ""}</tr>`).join("")).join("");
+      ${S.isAdmin ? `<td class="row-actions" data-label=""><button class="btn small" data-act="edit-kpi" data-id="${esc(i.id)}">Edit</button> <button class="btn small ghost danger" data-act="del-kpi" data-id="${esc(i.id)}">Delete</button></td>` : ""}</tr>`).join("")).join("");
   const props = S.proposals.filter((p) => p.status === "pending");
-  const propHtml = props.length ? `<div class="tbl-wrap"><table><thead><tr><th>Dept</th><th>KRA</th><th>Proposed KPI</th><th>Target</th><th>Freq</th><th>Owner</th><th>By</th>${S.isAdmin ? "<th></th>" : ""}</tr></thead><tbody>
+  const propHtml = props.length ? `<div class="tbl-wrap"><table class="resp"><thead><tr><th>Dept</th><th>KRA</th><th>Proposed KPI</th><th>Target</th><th>Freq</th><th>Owner</th><th>By</th>${S.isAdmin ? "<th></th>" : ""}</tr></thead><tbody>
     ${props.map((p) => `<tr><td>${esc((S.depts[p.dept] || {}).name || p.dept)}</td><td>${esc(p.kraName)}</td><td class="kpi">${esc(p.text)}${p.note ? `<div class="who">${esc(p.note)}</div>` : ""}</td><td>${esc(p.target)}</td><td><span class="freq">${esc(FREQ[p.freq] || p.freq)}</span></td><td>${esc(p.owner)}</td><td>${esc(nameOf(p.by))}</td>
-      ${S.isAdmin ? `<td style="white-space:nowrap"><button class="btn small primary" data-act="approve" data-id="${esc(p._id)}">Review &amp; add</button> <button class="btn small ghost danger" data-act="reject" data-id="${esc(p._id)}">Reject</button></td>` : ""}</tr>`).join("")}
+      ${S.isAdmin ? `<td class="row-actions" data-label=""><button class="btn small primary" data-act="approve" data-id="${esc(p._id)}">Review &amp; add</button> <button class="btn small ghost danger" data-act="reject" data-id="${esc(p._id)}">Reject</button></td>` : ""}</tr>`).join("")}
     </tbody></table></div>` : `<p class="note">No proposals waiting.</p>`;
+  const chips = ds.length < 2 ? "" : `<div class="chips" role="group" aria-label="Department">${ds.map((x) => `<button class="chip" data-act="mdept" data-dept="${x.id}" aria-pressed="${x.id === S.masterDept}">${esc(x.name)} <span class="note">${(x.items || []).length}</span></button>`).join("")}</div>`;
   return `<section class="panel">
-    <div class="head-row"><div><h2>All KRA &amp; KPI</h2><p class="sub">The approved list for every department. ${S.isAdmin ? "As admin you can add, edit and delete." : "HODs can propose a new KRA or KPI; the admin approves it."}</p></div>
+    <div class="head-row"><div><h2>${role() === "hod" ? "My KRA &amp; KPI" : "All KRA &amp; KPI"}</h2><p class="sub">${S.isAdmin ? "The approved list. As admin you can add, edit and delete." : "Your approved list. Propose a new KRA or KPI; the admin approves it."}</p></div>
       <div class="toolbar">${S.isAdmin ? `<button class="btn" data-act="add-dept">Add department</button><button class="btn primary" data-act="add-kpi">Add KPI</button>` : canPropose ? `<button class="btn primary" data-act="propose">Propose KRA / KPI</button>` : ""}</div></div>
-    <div class="chips" role="group" aria-label="Department">${ds.map((x) => `<button class="chip" data-act="mdept" data-dept="${x.id}" aria-pressed="${x.id === S.masterDept}">${esc(x.name)} <span class="note">${(x.items || []).length}</span></button>`).join("")}</div>
+    ${chips}
     <div class="toolbar"><input class="inp grow" id="q" type="search" placeholder="Search KPI, owner or number" value="${esc(S.q)}" aria-label="Search KPIs">
       <span class="note">HOD: ${esc(d.hod || "—")}</span>${S.isAdmin ? `<button class="btn small" data-act="edit-dept">Edit department</button>` : ""}</div>
-    <div class="tbl-wrap"><table><thead><tr><th></th><th>#</th><th>KPI</th><th>Target</th><th>Frequency</th><th>Owner</th>${S.isAdmin ? "<th></th>" : ""}</tr></thead><tbody>${rows || `<tr><td colspan="7" class="note">No KPIs match.</td></tr>`}</tbody></table></div>
+    <div class="tbl-wrap"><table class="resp"><thead><tr><th data-label="">KPI</th><th>Target</th><th>Frequency</th><th>Owner</th>${S.isAdmin ? "<th></th>" : ""}</tr></thead><tbody>${rows || `<tr><td colspan="5" class="note">No KPIs match.</td></tr>`}</tbody></table></div>
   </section>
-  <section class="panel"><div class="head-row"><div><h3>Proposals from HODs</h3><p class="sub">New KRAs and KPIs waiting for admin approval.</p></div></div>${propHtml}</section>`;
+  <section class="panel"><div class="head-row"><div><h3>Proposals</h3><p class="sub">New KRAs and KPIs waiting for admin approval.</p></div></div>${propHtml}</section>`;
 }
 
-/* Pending points */
+/* ---------- pending points ---------- */
 function vPending() {
   const ds = deptList(); const t = today();
   let acts = S.actions.slice();
@@ -606,48 +560,105 @@ function vPending() {
   const reds = [];
   ds.forEach((d) => { const r = S.results[d.id]; if (!r) return; Object.values(r.rows || {}).forEach((x) => { const rag = x.rag || ragOf(x.ach); if (rag === "R" || rag === "A") reds.push({ d, x, rag }); }); });
   reds.sort((a, b) => (a.rag === "R" ? 0 : 1) - (b.rag === "R" ? 0 : 1));
-  const canAdd = S.me && ["admin", "hod"].includes(S.me.role);
+  const canAdd = ["admin", "hod"].includes(role());
   const actRows = acts.map((a) => {
     const od = a.status !== "Done" && a.due && a.due < t; const dis = mayEditDept(a.dept) ? "" : "disabled";
     return `<tr><td>${esc((S.depts[a.dept] || {}).name || a.dept)}</td><td class="kpi">${esc(a.action)}${a.kpiNo ? `<div class="who">KPI ${esc(a.kpiNo)}${a.kpiText ? " · " + esc(a.kpiText) : ""}</div>` : ""}</td><td>${esc(a.owner)}</td>
-      <td class="${od ? "overdue" : ""}">${a.due ? esc(fmtShort(a.due)) : "—"}${od ? "<br>Overdue" : ""}</td>
+      <td class="${od ? "overdue" : ""}">${a.due ? esc(fmtShort(a.due)) : "—"}${od ? " · overdue" : ""}</td>
       <td><select class="inp" data-pstat="${esc(a._id)}" ${dis}>${["Open", "In progress", "Done", "Not done"].map((s) => `<option ${a.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></td>
       <td><input class="inp" data-pres="${esc(a._id)}" value="${esc(a.result || "")}" placeholder="Result" ${dis}></td>
-      <td>${S.isAdmin ? `<button class="btn small ghost danger" data-act="del-action" data-id="${esc(a._id)}">Delete</button>` : ""}</td></tr>`;
+      <td class="row-actions" data-label="">${S.isAdmin ? `<button class="btn small ghost danger" data-act="del-action" data-id="${esc(a._id)}">Delete</button>` : ""}</td></tr>`;
   }).join("");
   return `<section class="panel"><div class="head-row"><div><h2>Pending points</h2><p class="sub">Everything that needs follow-up for the meeting on ${esc(fmt(S.week))}.</p></div>${canAdd ? `<button class="btn primary" data-act="add-action">Add action</button>` : ""}</div>
     <div class="two">
-      <div><h3>Results not submitted</h3>${notSub.length ? `<ul class="list" style="margin-top:8px">${notSub.map((d) => `<li><span class="pill R">${S.results[d.id] ? "Draft only" : "Missing"}</span> ${esc(d.name)} <span class="note">${esc(d.hod || "")}</span></li>`).join("")}</ul>` : `<p class="note">All departments have submitted.</p>`}</div>
-      <div><h3>Red &amp; Amber KPIs this week</h3>${reds.length ? `<ul class="list" style="margin-top:8px">${reds.slice(0, 40).map(({ d, x, rag }) => `<li><span class="pill ${rag}">${x.ach != null ? x.ach + "%" : RAGN[rag]}</span> <b>${esc(d.name)}</b> ${esc(x.no)} ${esc(x.text)}${x.reason ? ` <span class="note">— ${esc(x.reason)}</span>` : ""}</li>`).join("")}</ul>` : `<p class="note">None reported yet.</p>`}</div>
+      <div><h3>Results not submitted</h3>${notSub.length ? `<ul class="list" style="margin-top:8px">${notSub.map((d) => `<li><span class="pill R">${S.results[d.id] ? "Draft only" : "Missing"}</span> ${esc(d.name)} <span class="note">${esc(d.hod || "")}</span></li>`).join("")}</ul>` : `<p class="note">All submitted.</p>`}</div>
+      <div><h3>Red &amp; Amber KPIs this week</h3>${reds.length ? `<ul class="list" style="margin-top:8px">${reds.slice(0, 40).map(({ d, x, rag }) => `<li><span class="pill ${rag}">${x.ach != null ? x.ach + "%" : RAGN[rag]}</span> <span><b>${esc(d.name)}</b> ${esc(x.no)} ${esc(x.text)}${x.reason ? ` <span class="note">— ${esc(x.reason)}</span>` : ""}</span></li>`).join("")}</ul>` : `<p class="note">None reported yet.</p>`}</div>
     </div></section>
   <section class="panel"><div class="head-row"><div><h3>Action tracker</h3><p class="sub">An action closes only when the result is shown.</p></div>
-    <div class="toolbar"><select class="inp" id="pendDept" aria-label="Department filter" style="width:auto"><option value="all">All departments</option>${ds.map((d) => `<option value="${d.id}" ${S.pendDept === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}</select>
+    <div class="toolbar">${ds.length > 1 ? `<select class="inp" id="pendDept" aria-label="Department filter" style="width:auto"><option value="all">All departments</option>${ds.map((d) => `<option value="${d.id}" ${S.pendDept === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}</select>` : ""}
     <div class="chips">${[["open", "Open"], ["overdue", "Overdue"], ["all", "All"]].map(([k, l]) => `<button class="chip" data-act="pfilter" data-k="${k}" aria-pressed="${S.pendFilter === k}">${l}</button>`).join("")}</div></div></div>
-    ${actRows ? `<div class="tbl-wrap"><table><thead><tr><th>Dept</th><th>Action</th><th>Owner</th><th>Due</th><th>Status</th><th>Result</th><th></th></tr></thead><tbody>${actRows}</tbody></table></div>` : `<div class="empty">No actions here. HODs add actions for Red KPIs when they submit results, or use “Add action”.</div>`}
+    ${actRows ? `<div class="tbl-wrap"><table class="resp"><thead><tr><th>Dept</th><th>Action</th><th>Owner</th><th>Due</th><th>Status</th><th>Result</th><th></th></tr></thead><tbody>${actRows}</tbody></table></div>` : `<div class="empty">No actions here. HODs add actions for Red KPIs when they submit results, or use “Add action”.</div>`}
   </section>`;
 }
 
-/* Users (admin) */
+/* ---------- users (admin): create logins with username + password ---------- */
 function vUsers() {
   const ds = deptList();
   const pend = S.profiles.filter((p) => p.role === "pending").length;
-  return `<section class="panel"><div class="head-row"><div><h2>Users</h2><p class="sub">Everyone who has signed in. New people start as <b>Pending</b> and see nothing until you give them a role. HODs can only submit for their own department.</p></div>${pend ? `<span class="pill A">${pend} waiting for access</span>` : ""}</div>
-    <div class="tbl-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Department</th></tr></thead><tbody>
+  const noUser = S.profiles.filter((p) => !p.username).length;
+  const deptOpts = (sel) => `<option value="">—</option>${ds.map((d) => `<option value="${d.id}" ${sel === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}`;
+  const roleOpts = (sel) => Object.entries(ROLES).map(([k, l]) => `<option value="${k}" ${sel === k ? "selected" : ""}>${l}</option>`).join("");
+  return `<section class="panel"><div class="head-row"><div><h2>Users</h2><p class="sub">Create a login for each person with a username and a password. Add their WhatsApp mobile number so the Saturday bot can reach them.</p></div><div>${pend ? `<span class="pill A">${pend} waiting for access</span>` : ""} ${noUser ? `<span class="pill R">${noUser} without a username — can't sign in</span>` : ""}</div></div>
+    <form class="form-grid" id="newUser" novalidate>
+      <label class="f">Name<input class="inp" id="nuName" required></label>
+      <label class="f">Username<input class="inp" id="nuUser" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="e.g. jayan" required></label>
+      <label class="f">WhatsApp mobile<input class="inp" id="nuPhone" inputmode="tel" placeholder="98765 43210"></label>
+      <label class="f">Role<select class="inp" id="nuRole">${roleOpts("hod")}</select></label>
+      <label class="f">Department<select class="inp" id="nuDept">${deptOpts("")}</select></label>
+      <label class="f">Password<div class="inline"><input class="inp" id="nuPw" required minlength="6"><button type="button" class="btn small" data-act="gen-pw">Make one</button></div></label>
+      <div class="f end"><button class="btn primary" type="submit" ${S.jobBusy === "user" ? "disabled" : ""}>Create login</button></div>
+    </form>
+    <p class="note">Share the username and password with the person. They can change the password after signing in (top bar → Password).</p>
+  </section>
+  <section class="panel"><h3>Everyone (${S.profiles.length})</h3>
+    <div class="tbl-wrap"><table class="resp"><thead><tr><th>Name</th><th>Username (login)</th><th>WhatsApp mobile</th><th>Role</th><th>Department</th><th></th></tr></thead><tbody>
     ${S.profiles.map((p) => `<tr>
       <td><input class="inp" data-uname="${esc(p.id)}" value="${esc(p.full_name || "")}" aria-label="Name"></td>
-      <td>${esc(p.email || "")}${p.id === S.session.user.id ? ' <span class="note">(you)</span>' : ""}</td>
-      <td><select class="inp" data-urole="${esc(p.id)}" aria-label="Role" ${p.id === S.session.user.id ? "disabled" : ""}>${Object.entries(ROLES).map(([k, l]) => `<option value="${k}" ${p.role === k ? "selected" : ""}>${l}</option>`).join("")}</select></td>
-      <td><select class="inp" data-udept="${esc(p.id)}" aria-label="Department"><option value="">—</option>${ds.map((d) => `<option value="${d.id}" ${p.dept_id === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}</select></td>
+      <td><input class="inp" data-uuser="${esc(p.id)}" autocapitalize="none" autocorrect="off" spellcheck="false" value="${esc(p.username || "")}" placeholder="set a username" aria-label="Username"></td>
+      <td><input class="inp" data-uphone="${esc(p.id)}" inputmode="tel" value="${esc(p.phone ? p.phone.replace(/^91/, "") : "")}" placeholder="add number" aria-label="Mobile"></td>
+      <td><select class="inp" data-urole="${esc(p.id)}" aria-label="Role" ${p.id === S.session.user.id ? "disabled" : ""}>${roleOpts(p.role)}</select></td>
+      <td><select class="inp" data-udept="${esc(p.id)}" aria-label="Department">${deptOpts(p.dept_id)}</select></td>
+      <td class="row-actions" data-label=""><button class="btn small" data-act="reset-pw" data-id="${esc(p.id)}">Reset password</button>${p.id !== S.session.user.id ? ` <button class="btn small ghost danger" data-act="del-user" data-id="${esc(p.id)}">Delete</button>` : ' <span class="note">(you)</span>'}</td>
     </tr>`).join("")}
     </tbody></table></div>
-    <p class="note">Roles: <b>Admin</b> (MD office) edits KRA/KPI, users and runs the MD review · <b>HOD</b> submits results for their department and proposes KPIs · <b>Viewer</b> reads everything.</p></section>`;
+    <p class="note"><b>Admin</b> (MD office): everything · <b>HOD</b>: only their own department's KPIs, results and actions · <b>Viewer</b>: reads everything · <b>Pending</b>: no access.</p></section>`;
 }
-async function updateProfile(id, patch, msg) {
-  const ok = await run(supabase.from("profiles").update(patch).eq("id", id), msg);
-  await loadProfiles(); if (!ok) render();
+const genPw = () => { const c = "abcdefghjkmnpqrstuvwxyz23456789"; let s = ""; const a = new Uint32Array(8); crypto.getRandomValues(a); a.forEach((n) => (s += c[n % c.length])); return s; };
+async function adminUser(body, msg) {
+  try { await callFn("admin-users", body); toast(msg); await loadProfiles(); render(); return true; }
+  catch (e) { toast(e.message); await loadProfiles(); render(); return false; }
 }
 
-/* ---------- modals: KPI, proposal, department, action ---------- */
+/* ---------- settings (admin): WhatsApp + Saturday schedule ---------- */
+function vSettings() {
+  const st = S.settings || { report_numbers: [], bot_scope: "weekly", tpl_start: "kpi_weekly_start", tpl_report: "kpi_weekly_report", tpl_lang: "ml" };
+  const busy = (k) => (S.jobBusy === k ? "disabled" : "");
+  return `<section class="panel"><div class="head-row"><div><h2>WhatsApp &amp; Saturday schedule</h2><p class="sub">Every Saturday: 9:30 AM the bot asks each HOD · 1:30 PM reminder to those not finished · 4:30 PM Claude's MD review · 5 PM the PPT goes to the numbers below.</p></div></div>
+    <form class="form-grid" id="stForm" novalidate>
+      <label class="f wide">WhatsApp numbers that get the Saturday PPT (comma separated)<input class="inp" id="stNums" inputmode="tel" value="${esc((st.report_numbers || []).map((n) => n.replace(/^91/, "")).join(", "))}" placeholder="98765 43210, 98470 12345"></label>
+      <label class="f">The bot asks<select class="inp" id="stScope"><option value="weekly" ${st.bot_scope === "weekly" ? "selected" : ""}>All weekly KPIs</option><option value="headline" ${st.bot_scope === "headline" ? "selected" : ""}>Only ★ headline KPIs</option></select></label>
+      <label class="f">Kickoff template name<input class="inp" id="stTs" value="${esc(st.tpl_start)}"></label>
+      <label class="f">PPT template name<input class="inp" id="stTr" value="${esc(st.tpl_report)}"></label>
+      <label class="f">Template language code<input class="inp" id="stTl" value="${esc(st.tpl_lang)}"></label>
+      <div class="f end"><button class="btn primary" type="submit">Save settings</button></div>
+    </form></section>
+  <section class="panel"><div class="head-row"><div><h3>Run now</h3><p class="sub">For week ${esc(weekRange(S.week))}. Use these to test, or if a scheduled run was missed.</p></div></div>
+    <div class="toolbar">
+      <button class="btn" data-act="job" data-job="kickoff" ${busy("kickoff")}>Send kickoff to all HODs</button>
+      <button class="btn" data-act="job" data-job="remind" ${busy("remind")}>Remind HODs not finished</button>
+      <button class="btn" data-act="job" data-job="review" ${busy("review")}>Run Claude MD review</button>
+      <button class="btn primary" data-act="job" data-job="ppt" ${busy("ppt")}>Make PPT &amp; send to WhatsApp</button>
+    </div>
+    ${S.jobBusy ? `<div class="thinking">Working… this can take a minute.</div>` : ""}
+  </section>
+  <section class="panel"><h3>Recent runs</h3>
+    ${S.jobs.length ? `<div class="tbl-wrap"><table class="resp"><thead><tr><th>When</th><th>Job</th><th>Week</th><th>Result</th><th>Details</th></tr></thead><tbody>
+      ${S.jobs.map((j) => `<tr><td>${esc(when(j.at))}</td><td>${esc(j.job)}</td><td>${j.week ? esc(fmtShort(j.week)) : "—"}</td><td><span class="pill ${j.ok ? "G" : "R"}">${j.ok ? "OK" : "Failed"}</span></td><td class="kpi">${esc(j.detail || "")}</td></tr>`).join("")}
+    </tbody></table></div>` : `<p class="note">Nothing has run yet.</p>`}
+  </section>`;
+}
+async function runJob(job) {
+  S.jobBusy = job; render();
+  try {
+    const r = await callFn("weekly-jobs", { action: job, week: S.week });
+    if (job === "ppt") toast(r.sent && r.sent.length ? `PPT sent to ${r.sent.length} WhatsApp number(s)` : "PPT made, but not sent: add numbers above or check WhatsApp setup");
+    else if (job === "review") { toast("MD review saved"); await loadReview(); }
+    else toast(`${job === "kickoff" ? "Kickoff" : "Reminder"} sent to ${(r.sent || []).length} HOD(s)${r.failed && r.failed.length ? `, ${r.failed.length} failed` : ""}`);
+  } catch (e) { toast("Failed: " + e.message); }
+  finally { S.jobBusy = ""; await loadAdmin(); render(); }
+}
+
+/* ---------- modals: KPI, proposal, department, action, password ---------- */
 function kraOptions(deptId, sel) {
   const d = S.depts[deptId];
   const kras = [...new Map(((d && d.items) || []).map((i) => [i.kraNo, { no: i.kraNo, name: i.kra }])).values()].sort((a, b) => a.no - b.no);
@@ -697,7 +708,7 @@ function kpiModal(deptId, item, fromProposal) {
   });
 }
 function proposeModal() {
-  const ds = deptList(); const dep0 = hodLocked() ? S.me.dept_id : S.masterDept;
+  const ds = deptList().filter((d) => mayEditDept(d.id)); const dep0 = hodLocked() ? S.me.dept_id : S.masterDept;
   openModal(`<h2>Propose a KRA / KPI</h2><p class="note">The admin reviews it and adds it to the approved list.</p>
     <div class="form-grid">
       <label class="f">Department<select class="inp" id="pDept">${ds.map((d) => `<option value="${d.id}" ${d.id === dep0 ? "selected" : ""}>${esc(d.name)}</option>`).join("")}</select></label>
@@ -755,8 +766,16 @@ function actionModal() {
     };
   });
 }
+function resetPwModal(id) {
+  const p = S.profiles.find((x) => x.id === id); const pw = genPw();
+  openModal(`<h2>Reset password</h2><p class="note">For ${esc(p.full_name || "")}${p.username ? ` (username <b>${esc(p.username)}</b>)` : ""}. Share the new password with them.</p>
+    <label class="f">New password<input class="inp" id="rpw" value="${pw}" minlength="6"></label>
+    <div class="actions"><button class="btn" data-close>Cancel</button><button class="btn primary" id="rpSave">Set password</button></div>`, (m) => {
+    m.querySelector("#rpSave").onclick = async () => { if (await adminUser({ action: "set_password", user_id: id, password: m.querySelector("#rpw").value }, "Password reset")) closeModal(); };
+  });
+}
 
-/* ---------- clicks ---------- */
+/* ---------- clicks & inputs ---------- */
 $("#main").addEventListener("click", async (e) => {
   const b = e.target.closest("[data-act]"); if (!b) return;
   const a = b.dataset.act;
@@ -797,6 +816,32 @@ $("#main").addEventListener("click", async (e) => {
   else if (a === "pfilter") { S.pendFilter = b.dataset.k; render(); }
   else if (a === "ai-check") { if (!S.aiBusy) runCheck(); }
   else if (a === "md-review") { if (!S.mdBusy) runMdReview(); }
+  else if (a === "gen-pw") { $("#nuPw").value = genPw(); }
+  else if (a === "reset-pw") resetPwModal(b.dataset.id);
+  else if (a === "del-user") { const p = S.profiles.find((x) => x.id === b.dataset.id); confirmModal(`Delete ${p.full_name || p.username || "this user"}'s login?`, "Delete", () => adminUser({ action: "delete", user_id: p.id }, "User deleted")); }
+  else if (a === "job") { if (!S.jobBusy) runJob(b.dataset.job); }
+});
+$("#main").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (e.target.id === "newUser") {
+    const name = $("#nuName").value.trim(), user = normUsername($("#nuUser").value), phone = $("#nuPhone").value.trim(), pw = $("#nuPw").value;
+    if (!name) return toast("Enter the person's name.");
+    if (!user) return toast("Username: 3–30 letters or numbers, no spaces (dot, dash, underscore allowed).");
+    if (phone && !normPhone(phone)) return toast("Enter a valid 10-digit mobile number (or leave it empty).");
+    if (pw.length < 6) return toast("Password must be at least 6 characters.");
+    S.jobBusy = "user";
+    const ok = await adminUser({ action: "create", full_name: name, username: user, phone: phone || null, password: pw, role: $("#nuRole").value, dept_id: $("#nuDept").value || null }, `Login created for ${name}`);
+    S.jobBusy = "";
+    if (ok) toast(`Login created. Username ${user} · password ${pw}`);
+    render();
+  }
+  if (e.target.id === "stForm") {
+    const nums = $("#stNums").value.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
+    const bad = nums.filter((n) => !normPhone(n));
+    if (bad.length) return toast("Not a valid mobile number: " + bad.join(", "));
+    const ok = await run(supabase.from("app_settings").update({ report_numbers: nums.map(normPhone), bot_scope: $("#stScope").value, tpl_start: $("#stTs").value.trim(), tpl_report: $("#stTr").value.trim(), tpl_lang: $("#stTl").value.trim() || "ml", updated_at: nowIso() }).eq("id", 1), "Settings saved");
+    if (ok) { await loadAdmin(); render(); }
+  }
 });
 $("#main").addEventListener("input", (e) => {
   if (e.target.id === "q") { S.q = e.target.value; const pos = e.target.selectionStart; render(); const q = $("#q"); q.focus(); q.setSelectionRange(pos, pos); }
@@ -806,120 +851,26 @@ $("#main").addEventListener("change", (e) => {
   if (t.id === "pendDept") { S.pendDept = t.value; render(); }
   else if (t.dataset.pstat) updateAction(t.dataset.pstat, { status: t.value });
   else if (t.dataset.pres) updateAction(t.dataset.pres, { result: t.value });
-  else if (t.dataset.urole) updateProfile(t.dataset.urole, { role: t.value }, "Role updated");
-  else if (t.dataset.udept) updateProfile(t.dataset.udept, { dept_id: t.value || null }, "Department updated");
-  else if (t.dataset.uname) updateProfile(t.dataset.uname, { full_name: t.value.trim() }, "Name updated");
+  else if (t.dataset.urole) adminUser({ action: "update", user_id: t.dataset.urole, role: t.value }, "Role updated");
+  else if (t.dataset.udept) adminUser({ action: "update", user_id: t.dataset.udept, dept_id: t.value || null }, "Department updated");
+  else if (t.dataset.uname) adminUser({ action: "update", user_id: t.dataset.uname, full_name: t.value.trim() }, "Name updated");
+  else if (t.dataset.uphone) {
+    if (t.value.trim() && !normPhone(t.value)) { toast("Enter a valid 10-digit mobile number."); return; }
+    adminUser({ action: "update", user_id: t.dataset.uphone, phone: t.value.trim() }, "WhatsApp mobile updated");
+  }
+  else if (t.dataset.uuser) {
+    const u = normUsername(t.value);
+    if (!u) { toast("Username: 3–30 letters or numbers, no spaces (dot, dash, underscore allowed)."); return; }
+    adminUser({ action: "update", user_id: t.dataset.uuser, username: u }, `Username changed — they now sign in as ${u}`);
+  }
 });
 
-/* ---------- PowerPoint ---------- */
+/* ---------- PowerPoint (same builder as the Saturday 5 PM job) ---------- */
 async function makePpt() {
   const btn = $("#pptBtn"); btn.disabled = true; const old = btn.textContent; btn.textContent = "Building…";
   try {
-    const INK = "12343B", GOLD = "B8892B", MUT = "5A6B6F", LINE = "D3DBD8";
-    const RC = { G: ["DDF0E4", "25734A"], A: ["F8E9CC", "9A6412"], R: ["F7DEDC", "B23434"], NA: ["E4E9E8", "6B7779"], none: ["E4E9E8", "6B7779"], "": ["FFFFFF", "5A6B6F"] };
-    const pptx = new PptxGenJS(); pptx.layout = "LAYOUT_WIDE"; pptx.title = "HOD Review " + S.week;
-    pptx.defineSlideMaster({
-      title: "M", background: { color: "FFFFFF" }, objects: [
-        { rect: { x: 0, y: 7.18, w: 13.33, h: 0.04, fill: { color: GOLD } } }, { rect: { x: 0, y: 7.26, w: 13.33, h: 0.04, fill: { color: GOLD } } },
-        { text: { text: "Atlas Maharani Group · Weekly HOD Review · " + fmt(S.week), options: { x: 0.5, y: 6.8, w: 9, h: 0.3, fontSize: 9, color: MUT, fontFace: "Calibri" } } }],
-      slideNumber: { x: 12.4, y: 6.8, w: 0.5, h: 0.3, fontSize: 9, color: MUT },
-    });
-    const head = (s, title, sub) => {
-      s.addText(title, { x: 0.5, y: 0.3, w: 12.3, h: 0.6, fontSize: 26, bold: true, color: INK, fontFace: "Calibri" });
-      if (sub) s.addText(sub, { x: 0.5, y: 0.9, w: 12.3, h: 0.4, fontSize: 13, color: MUT, fontFace: "Calibri" });
-    };
-    const H = (t) => ({ text: t, options: { bold: true, color: "FFFFFF", fill: { color: INK }, fontSize: 11 } });
-    const ragCell = (rag) => ({ text: RAGN[rag] || "—", options: { bold: true, fill: { color: RC[rag || ""][0] }, color: RC[rag || ""][1], align: "center" } });
-    const ratingCell = (rating) => { const k = RATINGS[rating] || ""; return { text: rating || "—", options: { bold: true, fill: { color: RC[k][0] }, color: RC[k][1] } }; };
-    const tblOpts = (colW, y) => ({ x: 0.5, y: y || 1.45, w: 12.33, colW, fontSize: 10, fontFace: "Calibri", color: "13262B", border: { type: "solid", pt: 0.5, color: LINE }, valign: "middle", margin: 0.05 });
-
-    const t = pptx.addSlide(); t.background = { color: INK };
-    t.addShape(pptx.ShapeType.rect, { x: 0, y: 5.2, w: 13.33, h: 0.06, fill: { color: GOLD } }); t.addShape(pptx.ShapeType.rect, { x: 0, y: 5.32, w: 13.33, h: 0.06, fill: { color: GOLD } });
-    t.addText("ATLAS MAHARANI GROUP", { x: 0.8, y: 1.4, w: 11, h: 0.4, fontSize: 14, color: "D9AE55", bold: true, charSpacing: 4, fontFace: "Calibri" });
-    t.addText("Weekly HOD Review", { x: 0.8, y: 1.9, w: 11, h: 1, fontSize: 44, color: "FFFFFF", bold: true, fontFace: "Calibri" });
-    t.addText(`KRA & KPI results · week ${weekRange(S.week)}`, { x: 0.8, y: 3.0, w: 11, h: 0.5, fontSize: 20, color: "E4ECEA", fontFace: "Calibri" });
-    t.addText(`Meeting: Monday ${fmt(S.week)}`, { x: 0.8, y: 3.6, w: 11, h: 0.4, fontSize: 16, color: "93A5A8", fontFace: "Calibri" });
-
-    const ds = deptList();
-    const snap = pptx.addSlide({ masterName: "M" });
-    const scores = []; const tot = { G: 0, A: 0, R: 0 };
-    const srows = [[H("Department"), H("HOD"), H("Submitted"), H("Score"), H("Status"), H("Green"), H("Amber"), H("Red"), H("Open actions")]];
-    ds.forEach((d) => {
-      const r = S.results[d.id]; const subm = r && r.status === "submitted"; const sm = r ? summarize(r.rows) : { score: null, counts: { G: 0, A: 0, R: 0 }, rag: "none" };
-      if (subm) { if (sm.score != null) scores.push(sm.score); for (const k in tot) tot[k] += sm.counts[k]; }
-      srows.push([{ text: d.name, options: { bold: true } }, d.hod || "", subm ? "Yes" : r ? "Draft" : "No", sm.score != null ? sm.score + "%" : "—", ragCell(subm ? sm.rag : "none"),
-        String(sm.counts.G), String(sm.counts.A), String(sm.counts.R), String(S.actions.filter((a) => a.dept === d.id && a.status !== "Done").length)]);
-    });
-    const grp = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
-    head(snap, "Group snapshot", `${scores.length} of ${ds.length} departments submitted · group score ${grp != null ? grp + "%" : "—"} · ${tot.G} Green, ${tot.A} Amber, ${tot.R} Red KPIs`);
-    snap.addTable(srows, tblOpts([2.3, 2.6, 1.1, 0.9, 1.2, 0.9, 0.9, 0.9, 1.53]));
-
-    const rv = S.review;
-    if (rv) {
-      const s = pptx.addSlide({ masterName: "M" }); head(s, "MD office review (by Claude)", rv.headline || "");
-      const lines = [];
-      if (rv.groupView) lines.push({ text: rv.groupView, options: { fontSize: 14, breakLine: true, paraSpaceAfter: 8 } });
-      if ((rv.watchList || []).length) { lines.push({ text: "Watch list this week", options: { bold: true, fontSize: 15, color: INK, breakLine: true } }); rv.watchList.forEach((x) => lines.push({ text: x, options: { bullet: true, fontSize: 13, breakLine: true } })); }
-      if ((rv.crossDept || []).length) { lines.push({ text: "Across departments", options: { bold: true, fontSize: 15, color: INK, breakLine: true, paraSpaceBefore: 8 } }); rv.crossDept.forEach((x) => lines.push({ text: x, options: { bullet: true, fontSize: 13, breakLine: true } })); }
-      if (lines.length) s.addText(lines, { x: 0.5, y: 1.45, w: 12.3, h: 5.2, valign: "top", fontFace: "Calibri", color: "13262B", fit: "shrink" });
-      const rr = [[H("Department"), H("Claude rating"), H("Verdict")]];
-      (rv.departments || []).forEach((x) => rr.push([(S.depts[x.dept] || {}).name || x.dept, ratingCell(x.rating), x.verdict]));
-      if (rr.length > 1) { const s2 = pptx.addSlide({ masterName: "M" }); head(s2, "Result-oriented or just duty?", "Claude's rating of how each department reported this week"); s2.addTable(rr, tblOpts([2.2, 2.1, 8.03])); }
-    }
-
-    const order = { R: 0, A: 1, G: 2, NA: 3, "": 4 };
-    ds.forEach((d) => {
-      const r = S.results[d.id]; const sm = r ? summarize(r.rows) : null;
-      if (!r) { const s = pptx.addSlide({ masterName: "M" }); head(s, d.name, `HOD ${d.hod || ""}`); s.addText("Results not submitted for this week.", { x: 0.5, y: 2.5, w: 12.3, h: 1, fontSize: 24, color: "B23434", bold: true, align: "center" }); return; }
-      const rows = Object.entries(r.rows || {}).map(([id, x]) => ({ id, ...x, rag: x.rag || ragOf(x.ach) }))
-        .sort((a, b) => order[a.rag] - order[b.rag] || (b.star ? 1 : 0) - (a.star ? 1 : 0) || String(a.no).localeCompare(String(b.no), undefined, { numeric: true }));
-      const per = 9; const pages = Math.max(1, Math.ceil(rows.length / per));
-      for (let p = 0; p < pages; p++) {
-        const s = pptx.addSlide({ masterName: "M" });
-        head(s, `${d.name} — ${sm.score != null ? sm.score + "%" : "—"} ${sm.rag !== "none" ? "· " + RAGN[sm.rag] : ""}`, `HOD ${d.hod || ""} · ${sm.counts.G} Green, ${sm.counts.A} Amber, ${sm.counts.R} Red${r.status !== "submitted" ? " · DRAFT, not submitted" : ""}${pages > 1 ? ` · page ${p + 1} of ${pages}` : ""}`);
-        const tr = [[H(""), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Status"), H("Reason / data")]];
-        rows.slice(p * per, p * per + per).forEach((x) => tr.push([x.star ? { text: "★", options: { color: GOLD, align: "center" } } : "", x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "—", ragCell(x.rag), [x.reason, x.data].filter(Boolean).join(" · ")]));
-        if (tr.length === 1) tr.push(["", "", "No KPI rows entered", "", "", "", "", ""]);
-        s.addTable(tr, tblOpts([0.35, 0.6, 4.1, 1.35, 1.0, 0.8, 0.95, 3.18]));
-      }
-      const pri = (r.priorities || []).filter(Boolean); const newActs = S.actions.filter((a) => a.dept === d.id && a.week === S.week);
-      const drv = S.review && (S.review.departments || []).find((x) => x.dept === d.id); const ai = r.ai;
-      if (pri.length || r.support || newActs.length || drv || ai) {
-        const s = pptx.addSlide({ masterName: "M" });
-        head(s, `${d.name} — plan & Claude's questions`, ai ? `Claude check: ${ai.rating}${ai.score != null ? " · evidence " + ai.score + "/100" : ""}` : "Not checked by Claude");
-        const lines = [];
-        if (drv && (drv.questions || []).length) { lines.push({ text: "Ask on Monday", options: { bold: true, fontSize: 16, color: "B23434", breakLine: true } }); drv.questions.forEach((x) => lines.push({ text: x, options: { bullet: true, fontSize: 14, breakLine: true } })); }
-        const unans = ai ? (ai.flags || []).filter((x) => !(x.answer || "").trim()) : [];
-        if (unans.length) { lines.push({ text: "Claude's questions not answered by HOD", options: { bold: true, fontSize: 16, color: "B23434", breakLine: true, paraSpaceBefore: 10 } }); unans.forEach((x) => lines.push({ text: (x.kpiNo ? "KPI " + x.kpiNo + ": " : "") + x.question, options: { bullet: true, fontSize: 13, breakLine: true } })); }
-        if (drv && (drv.suggestions || []).length) { lines.push({ text: "Suggestions", options: { bold: true, fontSize: 16, color: INK, breakLine: true, paraSpaceBefore: 10 } }); drv.suggestions.forEach((x) => lines.push({ text: x, options: { bullet: true, fontSize: 14, breakLine: true } })); }
-        if (pri.length) { lines.push({ text: "Top priorities", options: { bold: true, fontSize: 16, color: INK, breakLine: true, paraSpaceBefore: 10 } }); pri.forEach((x) => lines.push({ text: x, options: { bullet: true, fontSize: 14, breakLine: true } })); }
-        if (newActs.length) {
-          lines.push({ text: "Actions for Red KPIs", options: { bold: true, fontSize: 16, color: INK, breakLine: true, paraSpaceBefore: 10 } });
-          newActs.forEach((a) => lines.push({ text: `${a.kpiNo ? "KPI " + a.kpiNo + ": " : ""}${a.action} — ${a.owner || "owner?"}, by ${a.due ? fmtShort(a.due) : "date?"}`, options: { bullet: true, fontSize: 14, breakLine: true } }));
-        }
-        if (r.support) { lines.push({ text: "Support needed", options: { bold: true, fontSize: 16, color: INK, breakLine: true, paraSpaceBefore: 10 } }); lines.push({ text: r.support, options: { fontSize: 14, breakLine: true } }); }
-        if (lines.length) s.addText(lines, { x: 0.5, y: 1.45, w: 12.3, h: 5.2, valign: "top", fontFace: "Calibri", color: "13262B", fit: "shrink" });
-      }
-    });
-
-    const reds = [];
-    ds.forEach((d) => { const r = S.results[d.id]; if (!r) return; Object.values(r.rows || {}).forEach((x) => { if ((x.rag || ragOf(x.ach)) === "R") reds.push([d.name, x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "—", x.reason || ""]); }); });
-    for (let p = 0; p < Math.max(1, Math.ceil(reds.length / 10)); p++) {
-      const s = pptx.addSlide({ masterName: "M" });
-      head(s, "Red KPIs across the group", reds.length ? `${reds.length} KPIs below 80% of target — each needs an owner, action and date` : "No Red KPIs reported this week");
-      if (reds.length) s.addTable([[H("Department"), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Reason")], ...reds.slice(p * 10, p * 10 + 10)], tblOpts([1.8, 0.6, 4.0, 1.4, 1.0, 0.8, 2.73]));
-    }
-    const t0 = today();
-    const acts = S.actions.filter((a) => a.status !== "Done").sort((a, b) => (a.due || "9999").localeCompare(b.due || "9999"));
-    for (let p = 0; p < Math.max(1, Math.ceil(acts.length / 11)); p++) {
-      const s = pptx.addSlide({ masterName: "M" }); const od = acts.filter((a) => a.due && a.due < t0).length;
-      head(s, "Pending points — action tracker", acts.length ? `${acts.length} open actions · ${od} overdue` : "No open actions");
-      if (acts.length) s.addTable([[H("Department"), H("KPI"), H("Action"), H("Owner"), H("Due"), H("Status")], ...acts.slice(p * 11, p * 11 + 11).map((a) => {
-        const late = a.due && a.due < t0;
-        return [(S.depts[a.dept] || {}).name || a.dept, a.kpiNo || "", a.action, a.owner || "", { text: a.due ? fmtShort(a.due) + (late ? " · overdue" : "") : "—", options: late ? { color: "B23434", bold: true } : {} }, a.status];
-      })], tblOpts([1.8, 0.7, 5.3, 1.8, 1.4, 1.33]));
-    }
-    await pptx.writeFile({ fileName: `HOD-Review-${S.week}.pptx` });
+    const deck = buildDeck(PptxGenJS, { week: S.week, depts: S.depts, results: S.results, prev: S.prev, actions: S.actions, review: S.review, today: today() });
+    await deck.writeFile({ fileName: `HOD-Review-${S.week}.pptx` });
     toast("PowerPoint downloaded");
   } catch (e) { toast("Couldn't make the PPT: " + ((e && e.message) || "try again")); }
   finally { btn.disabled = false; btn.textContent = old; }
@@ -928,17 +879,17 @@ async function makePpt() {
 /* ---------- start ---------- */
 async function start(session) {
   S.session = session;
-  if (!session) { S.ready = false; if (S.channel) { supabase.removeChannel(S.channel); S.channel = null; } showLogin(false); return; }
-  $("#main").innerHTML = `<div class="empty">Loading departments and KPIs…</div>`;
+  if (!session) { S.ready = false; if (S.channel) { supabase.removeChannel(S.channel); S.channel = null; } showLogin(); return; }
+  $("#main").innerHTML = `<div class="empty">Loading…</div>`;
   await loadProfiles();
   if (!S.me || S.me.role === "pending") {
     showPending();
-    // open automatically once the admin approves
     if (S.channel) supabase.removeChannel(S.channel);
     S.channel = supabase.channel("me").on("postgres_changes", { event: "UPDATE", schema: "public", table: "profiles", filter: `id=eq.${session.user.id}` }, () => start(S.session)).subscribe();
     return;
   }
   S.isAdmin = S.me.role === "admin"; S.canWrite = ["admin", "hod"].includes(S.me.role);
+  if (!LS.get("tab", null)) S.tab = (TABS[role()] || ["submit"])[0];
   await loadAll(); S.ready = true; render(); subscribe();
 }
 let started = null;

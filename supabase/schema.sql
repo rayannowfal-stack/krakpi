@@ -1,5 +1,6 @@
 -- Atlas Maharani Group · Weekly KPI Review
--- Run this once in Supabase: Dashboard → SQL Editor → New query → paste → Run.
+-- Run in Supabase: Dashboard → SQL Editor → New query → paste → Run.
+-- Safe to run again: it updates an existing database to the latest version without losing data.
 
 -- ============ Tables ============
 
@@ -98,6 +99,62 @@ create table if not exists public.reviews (
   created_at  timestamptz not null default now()
 );
 
+-- ============ Version 2 additions (mobile login, WhatsApp bot, schedule) ============
+
+alter table public.profiles add column if not exists phone text;           -- WhatsApp number, 91XXXXXXXXXX
+create unique index if not exists profiles_phone_key on public.profiles(phone) where phone is not null;
+
+-- ============ Version 2.1: username + password login (no email anywhere) ============
+-- Behind each username is a hidden login address  <username>@u.atlas-kpi.app  that nobody types or sees.
+alter table public.profiles add column if not exists username text;
+create unique index if not exists profiles_username_key on public.profiles(lower(username)) where username is not null;
+alter table public.results  add column if not exists source text not null default 'app';  -- 'app' or 'whatsapp'
+
+-- One row of settings, edited by the admin in the app (Settings tab)
+create table if not exists public.app_settings (
+  id              int primary key default 1 check (id = 1),
+  report_numbers  text[] not null default '{}',          -- WhatsApp numbers that get the Saturday 5 PM PPT
+  bot_scope       text not null default 'weekly' check (bot_scope in ('weekly','headline')),
+  tpl_start       text not null default 'kpi_weekly_start',   -- approved WhatsApp template names
+  tpl_report      text not null default 'kpi_weekly_report',
+  tpl_lang        text not null default 'ml',
+  updated_at      timestamptz not null default now()
+);
+insert into public.app_settings (id) values (1) on conflict (id) do nothing;
+
+-- WhatsApp conversation state, one row per phone (server only)
+create table if not exists public.wa_sessions (
+  phone       text primary key,
+  user_id     uuid references auth.users(id) on delete cascade,
+  dept_id     text references public.departments(id) on delete cascade,
+  week        date,
+  step        text not null default 'idle',
+  idx         int  not null default 0,
+  items       jsonb not null default '[]'::jsonb,
+  sub         text,
+  updated_at  timestamptz not null default now()
+);
+
+-- WhatsApp message log (for checking what the bot said and received)
+create table if not exists public.wa_log (
+  id          bigint generated always as identity primary key,
+  msg_id      text unique,
+  phone       text,
+  direction   text check (direction in ('in','out')),
+  body        text,
+  at          timestamptz not null default now()
+);
+
+-- Scheduled job runs (kickoff, reminder, review, PPT)
+create table if not exists public.job_runs (
+  id          bigint generated always as identity primary key,
+  job         text not null,
+  week        date,
+  ok          boolean not null,
+  detail      text,
+  at          timestamptz not null default now()
+);
+
 -- ============ Helper functions ============
 
 create or replace function public.my_role() returns text
@@ -122,6 +179,12 @@ language sql stable security definer set search_path = public as $$
   select public.my_role() in ('admin','hod','viewer');
 $$;
 
+-- Who may READ a department's data: admin and viewer see all; a HOD sees only their own department
+create or replace function public.can_read_dept(d text) returns boolean
+language sql stable security definer set search_path = public as $$
+  select public.my_role() in ('admin','viewer') or (public.my_role() = 'hod' and public.my_dept() = d);
+$$;
+
 create or replace function public.can_write_dept(d text) returns boolean
 language sql stable security definer set search_path = public as $$
   select public.is_admin() or (public.my_role() = 'hod' and public.my_dept() = d);
@@ -131,8 +194,12 @@ $$;
 create or replace function public.handle_new_user() returns trigger
 language plpgsql security definer set search_path = public as $$
 begin
-  insert into public.profiles (id, email, full_name)
-  values (new.id, new.email, coalesce(new.raw_user_meta_data->>'full_name', split_part(new.email, '@', 1)))
+  insert into public.profiles (id, email, full_name, phone, username)
+  values (new.id,
+          case when new.email like '%@u.atlas-kpi.app' or new.email like '%@m.atlas-kpi.app' then null else new.email end,
+          coalesce(nullif(new.raw_user_meta_data->>'full_name', ''), split_part(new.email, '@', 1)),
+          nullif(new.raw_user_meta_data->>'phone', ''),
+          case when new.email like '%@u.atlas-kpi.app' then split_part(new.email, '@', 1) else null end)
   on conflict (id) do nothing;
   return new;
 end $$;
@@ -147,8 +214,9 @@ create or replace function public.guard_profile() returns trigger
 language plpgsql security definer set search_path = public as $$
 begin
   if auth.uid() is not null and not public.is_admin()
-     and (new.role is distinct from old.role or new.dept_id is distinct from old.dept_id) then
-    raise exception 'Only an admin can change roles and departments';
+     and (new.role is distinct from old.role or new.dept_id is distinct from old.dept_id
+          or new.username is distinct from old.username or new.phone is distinct from old.phone) then
+    raise exception 'Only an admin can change roles, departments, usernames and mobile numbers';
   end if;
   return new;
 end $$;
@@ -156,6 +224,54 @@ end $$;
 drop trigger if exists profiles_guard on public.profiles;
 create trigger profiles_guard before update on public.profiles
   for each row execute function public.guard_profile();
+
+-- Set (or change) anyone's username + password from the SQL Editor. Used once for the first admin:
+--   select public.set_login('your-old-email@gmail.com', 'nowfal', 'YourNewPassword', 'admin');
+-- "find" can be the old email, the current username, or the mobile number.
+create or replace function public.set_login(find text, new_username text, new_password text, new_role text default null)
+returns text language plpgsql security definer set search_path = public, auth, extensions as $$
+declare
+  uid uuid;
+  u text := lower(trim(new_username));
+  f text := lower(trim(find));
+  login text;
+begin
+  if u !~ '^[a-z0-9][a-z0-9._-]{2,29}$' then raise exception 'Username: 3-30 letters or numbers (dot, dash, underscore allowed), no spaces'; end if;
+  if length(coalesce(new_password, '')) < 6 then raise exception 'Password must be at least 6 characters'; end if;
+  if new_role is not null and new_role not in ('admin','hod','viewer','pending') then raise exception 'Unknown role %', new_role; end if;
+  select p.id into uid from public.profiles p
+   where lower(p.username) = f or lower(p.email) = f
+      or p.phone = regexp_replace(f, '\D', '', 'g') or p.phone = '91' || regexp_replace(f, '\D', '', 'g')
+   limit 1;
+  if uid is null then select id into uid from auth.users where lower(email) = f limit 1; end if;
+  if uid is null then raise exception 'No account found for %', find; end if;
+  if exists (select 1 from public.profiles where lower(username) = u and id <> uid) then raise exception 'Username % is already taken', u; end if;
+  login := u || '@u.atlas-kpi.app';
+  update auth.users set email = login,
+         encrypted_password = extensions.crypt(new_password, extensions.gen_salt('bf')),
+         email_confirmed_at = coalesce(email_confirmed_at, now()), updated_at = now()
+   where id = uid;
+  update auth.identities set identity_data = identity_data || jsonb_build_object('email', login, 'email_verified', true)
+   where user_id = uid and provider = 'email';
+  update public.profiles set username = u, email = null, role = coalesce(new_role, role) where id = uid;
+  return 'Done. Sign in with username "' || u || '" and the new password.';
+end $$;
+revoke all on function public.set_login(text, text, text, text) from public, anon, authenticated;
+
+-- Upgrade: accounts made with the mobile-number login (version 2.0) become username = their 10-digit mobile.
+do $$
+declare r record; u text;
+begin
+  for r in select au.id, p.phone from auth.users au join public.profiles p on p.id = au.id
+            where au.email like '%@m.atlas-kpi.app' and p.username is null loop
+    u := right(coalesce(r.phone, split_part((select email from auth.users where id = r.id), '@', 1)), 10);
+    if exists (select 1 from public.profiles where lower(username) = u) then continue; end if;
+    update auth.users set email = u || '@u.atlas-kpi.app' where id = r.id;
+    update auth.identities set identity_data = identity_data || jsonb_build_object('email', u || '@u.atlas-kpi.app')
+     where user_id = r.id and provider = 'email';
+    update public.profiles set username = u where id = r.id;
+  end loop;
+end $$;
 
 -- ============ Row level security ============
 
@@ -167,28 +283,28 @@ alter table public.results     enable row level security;
 alter table public.actions     enable row level security;
 alter table public.reviews     enable row level security;
 
--- profiles: you always see your own row; approved users see everyone; you edit your own name; admin edits all
+-- profiles: you always see your own row; admin and viewer see everyone; you edit your own name; admin edits all
 drop policy if exists profiles_read on public.profiles;
-create policy profiles_read on public.profiles for select to authenticated using (id = auth.uid() or public.is_member());
+create policy profiles_read on public.profiles for select to authenticated using (id = auth.uid() or public.my_role() in ('admin','viewer'));
 drop policy if exists profiles_update_self on public.profiles;
 create policy profiles_update_self on public.profiles for update to authenticated using (id = auth.uid() or public.is_admin()) with check (id = auth.uid() or public.is_admin());
 
--- departments + kpis: approved users read; only admin writes
+-- departments + kpis: admin/viewer read all, HOD reads own department; only admin writes
 drop policy if exists dept_read on public.departments;
-create policy dept_read on public.departments for select to authenticated using (public.is_member());
+create policy dept_read on public.departments for select to authenticated using (public.can_read_dept(id));
 drop policy if exists dept_admin on public.departments;
 create policy dept_admin on public.departments for all to authenticated using (public.is_admin()) with check (public.is_admin());
 
 drop policy if exists kpis_read on public.kpis;
-create policy kpis_read on public.kpis for select to authenticated using (public.is_member());
+create policy kpis_read on public.kpis for select to authenticated using (public.can_read_dept(dept_id));
 drop policy if exists kpis_admin on public.kpis;
 create policy kpis_admin on public.kpis for all to authenticated using (public.is_admin()) with check (public.is_admin());
 
 -- proposals: approved users read; HOD/admin propose; only admin approves or rejects
 drop policy if exists prop_read on public.proposals;
-create policy prop_read on public.proposals for select to authenticated using (public.is_member());
+create policy prop_read on public.proposals for select to authenticated using (public.can_read_dept(dept_id));
 drop policy if exists prop_insert on public.proposals;
-create policy prop_insert on public.proposals for insert to authenticated with check (public.my_role() in ('admin','hod'));
+create policy prop_insert on public.proposals for insert to authenticated with check (public.can_write_dept(dept_id));
 drop policy if exists prop_admin_update on public.proposals;
 create policy prop_admin_update on public.proposals for update to authenticated using (public.is_admin()) with check (public.is_admin());
 drop policy if exists prop_admin_delete on public.proposals;
@@ -196,7 +312,7 @@ create policy prop_admin_delete on public.proposals for delete to authenticated 
 
 -- results: approved users read; HOD writes only their own department; admin writes all
 drop policy if exists res_read on public.results;
-create policy res_read on public.results for select to authenticated using (public.is_member());
+create policy res_read on public.results for select to authenticated using (public.can_read_dept(dept_id));
 drop policy if exists res_insert on public.results;
 create policy res_insert on public.results for insert to authenticated with check (public.can_write_dept(dept_id));
 drop policy if exists res_update on public.results;
@@ -206,7 +322,7 @@ create policy res_delete on public.results for delete to authenticated using (pu
 
 -- actions: approved users read; HOD adds/updates their department's; admin all; only admin deletes
 drop policy if exists act_read on public.actions;
-create policy act_read on public.actions for select to authenticated using (public.is_member());
+create policy act_read on public.actions for select to authenticated using (public.can_read_dept(dept_id));
 drop policy if exists act_insert on public.actions;
 create policy act_insert on public.actions for insert to authenticated with check (public.can_write_dept(dept_id));
 drop policy if exists act_update on public.actions;
@@ -216,15 +332,38 @@ create policy act_delete on public.actions for delete to authenticated using (pu
 
 -- reviews (Claude MD office review): approved users read; only admin writes
 drop policy if exists rev_read on public.reviews;
-create policy rev_read on public.reviews for select to authenticated using (public.is_member());
+create policy rev_read on public.reviews for select to authenticated using (public.my_role() in ('admin','viewer'));
 drop policy if exists rev_admin on public.reviews;
 create policy rev_admin on public.reviews for all to authenticated using (public.is_admin()) with check (public.is_admin());
+
+-- settings: admin only (read + write)
+alter table public.app_settings enable row level security;
+drop policy if exists settings_admin on public.app_settings;
+create policy settings_admin on public.app_settings for all to authenticated using (public.is_admin()) with check (public.is_admin());
+
+-- WhatsApp sessions: server only (no policies = no access from the app)
+alter table public.wa_sessions enable row level security;
+
+-- WhatsApp log and job runs: admin can read; only the server writes
+alter table public.wa_log enable row level security;
+drop policy if exists wa_log_admin on public.wa_log;
+create policy wa_log_admin on public.wa_log for select to authenticated using (public.is_admin());
+alter table public.job_runs enable row level security;
+drop policy if exists job_runs_admin on public.job_runs;
+create policy job_runs_admin on public.job_runs for select to authenticated using (public.is_admin());
+
+-- Private storage for the weekly PowerPoint files
+do $$
+begin
+  insert into storage.buckets (id, name, public) values ('reports', 'reports', false) on conflict (id) do nothing;
+exception when undefined_table or invalid_schema_name then null;
+end $$;
 
 -- ============ Live updates ============
 do $$
 declare t text;
 begin
-  foreach t in array array['departments','kpis','proposals','results','actions','reviews','profiles'] loop
+  foreach t in array array['departments','kpis','proposals','results','actions','reviews','profiles','job_runs'] loop
     begin
       execute format('alter publication supabase_realtime add table public.%I', t);
     exception when duplicate_object then null;

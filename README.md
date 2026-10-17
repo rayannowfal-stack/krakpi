@@ -1,135 +1,154 @@
-# Atlas KPI Review
+# Atlas KPI Review — version 2.1
 
 Weekly KRA & KPI review for the Atlas Maharani Group Monday HOD meeting.
-HODs submit their week's results with supporting data, Claude checks that the results are
-**result-oriented and not just duty**, the MD office gets a Claude review with questions for
-Monday, and one click builds the PowerPoint for the meeting.
+
+- **HODs see only their own department** — enforced in the database, not just hidden on screen.
+- **Login with username + password.** No email anywhere — not for HODs, not for the admin. The admin creates each login. The mobile number is only for WhatsApp.
+- **WhatsApp chatbot:** on Saturday the bot asks each HOD their KPIs one by one, records every answer in the app, then asks Claude's clarification questions **in Malayalam** and records those answers too.
+- **Saturday 5 PM:** the PowerPoint (same format as the app's *Make PPT*) is built automatically and sent on WhatsApp.
+- **Fits every screen:** phone, tablet, laptop and PC.
 
 ## What's inside
 
 | Part | Technology | Where |
 |---|---|---|
-| Web app | HTML, CSS, plain JavaScript, built with **Vite** | `index.html`, `src/` |
-| Database, login, live updates | **Supabase** (Postgres + Auth + Realtime) | `supabase/schema.sql` |
-| Security | Postgres row-level security by role | `supabase/schema.sql` |
-| KRA/KPI data | 8 departments, 266 KPIs from your KRA files | `supabase/seed.sql` |
-| Claude review | **Supabase Edge Functions** calling the **Claude API** | `supabase/functions/` |
-| PowerPoint | **PptxGenJS** (built in the browser) | `src/main.js` |
-| Hosting | Netlify or Vercel (free plans are enough to start) | `netlify.toml` |
+| Web app | HTML, CSS, JavaScript, built with **Vite** | `index.html`, `src/` |
+| Shared logic (app + server) | scoring, dates, PowerPoint layout | `supabase/functions/_shared/core.js`, `ppt-builder.js` |
+| Database, login, live updates | **Supabase** (Postgres + Auth + Realtime + Storage) | `supabase/schema.sql`, `seed.sql` |
+| Claude | **Claude API** from Supabase Edge Functions | `ai-check`, `ai-review` |
+| WhatsApp bot | **WhatsApp Business Platform (Meta Cloud API)** | `whatsapp` function |
+| Saturday schedule | **pg_cron** inside Supabase | `supabase/cron.sql`, `weekly-jobs` function |
+| User logins | Supabase Auth admin API | `admin-users` function |
+| Paste-ready functions | one file each, for the Supabase website editor | `supabase/dashboard-paste/` |
 
 ### Roles
 
-| Role | Can do |
-|---|---|
-| **Admin** (MD office) | Everything: edit KRA/KPI and departments, approve proposals, give people access, run the MD review, delete actions |
-| **HOD** | Submit results for **their own department only**, run the Claude check, update their actions, propose new KRA/KPI |
-| **Viewer** | Read everything |
-| **Pending** | Anyone who signs in for the first time. Sees nothing until an admin gives them a role |
-
-These rules are enforced inside the database, not just hidden in the screens.
-
-### How the Claude check works
-
-1. The HOD enters the week's actuals, reasons and supporting data.
-2. **Check with Claude** sends the sheet to the `ai-check` function, which asks Claude (Sonnet 5.5)
-   to rate it *Result-oriented / Partly result-oriented / Activity only*, give an evidence score,
-   ask clarification questions and suggest improvements.
-3. The HOD must answer the high-severity questions. Submit stays blocked until the sheet has been
-   checked, figures haven't changed since, and those questions are answered.
-4. In **MD Office**, an admin presses **Generate MD review**: the `ai-review` function sends every
-   department's sheet, the HODs' answers, last week's scores and the action tracker to Claude
-   (Opus 5.5), and saves the review. It also goes into the PowerPoint.
-
-The Claude API key is stored only as a Supabase secret. It never reaches the browser.
-
----
-
-## Setup (about 30–45 minutes, one time)
-
-You need: a computer with **Node.js 20+**, a free **Supabase** account, a **Claude API** key
-from the Claude Console, and a free **Netlify** (or Vercel) account.
-
-### 1. Create the Supabase project
-
-1. Go to supabase.com → **New project**. Name it `atlas-kpi`, pick region **Mumbai (ap-south-1)**, set a database password and keep it safe.
-2. When it's ready, open **SQL Editor → New query**, paste all of `supabase/schema.sql`, press **Run**.
-3. New query again, paste all of `supabase/seed.sql`, press **Run**. This loads the 8 departments and 266 KPIs.
-
-### 2. Turn on email login
-
-1. **Authentication → Providers → Email**: keep it enabled (magic link is on by default).
-2. **Authentication → URL Configuration**: set **Site URL** to your app address (for now `http://localhost:5173`; change it after step 5).
-3. Supabase's built-in email is for testing only and sends very few emails per hour. Before the HODs start, set up your own sender in **Authentication → Emails → SMTP Settings** (Gmail/Google Workspace, Zoho or any SMTP provider works).
-
-### 3. Add the Claude functions
-
-Install the Supabase CLI (see supabase.com/docs/guides/cli), then in this folder:
-
-```bash
-supabase login
-supabase link --project-ref YOUR-PROJECT-ID
-supabase secrets set ANTHROPIC_API_KEY=sk-ant-...your key...
-supabase functions deploy ai-check
-supabase functions deploy ai-review
-```
-
-Optional: choose different Claude models with
-`supabase secrets set CLAUDE_MODEL_CHECK=claude-sonnet-5-5 CLAUDE_MODEL_REVIEW=claude-opus-5-5`.
-
-### 4. Run the app on your computer
-
-```bash
-cp .env.example .env      # then paste your Supabase URL and anon key (Project Settings → API)
-npm install
-npm run dev               # opens http://localhost:5173
-```
-
-Sign in with your email. You'll see **Waiting for access** — that's expected. Make yourself admin
-once in **SQL Editor**:
-
-```sql
-update public.profiles set role = 'admin' where email = 'you@yourcompany.com';
-```
-
-Refresh: you're the admin. From now on, give everyone else access in the app's **Users** tab
-(set **Role** = HOD and their **Department**).
-
-### 5. Put it online
-
-**Netlify:** push this folder to a GitHub repository → Netlify → **Add new site → Import from Git**.
-Build command `npm run build`, publish directory `dist` (already in `netlify.toml`).
-Under **Site settings → Environment variables** add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`, then deploy.
-
-Then go back to Supabase **Authentication → URL Configuration** and set **Site URL** to your Netlify
-address (or your own domain, e.g. `kpi.atlasmaharani.com`).
-
----
-
-## Weekly routine
-
-| When | Who | What |
+| Role | Sees | Can do |
 |---|---|---|
-| Mon–Sat | HODs | Enter the week's figures, **Check with Claude**, answer questions, **Submit results** |
-| Monday morning | MD office | **MD Office → Generate MD review**, read the questions for each HOD |
-| Monday meeting | MD / CEO | **Make PPT** and present; new actions go to **Pending points** |
+| **Admin** (MD office) | Everything | Edit KRA/KPI, create logins, settings, run MD review, PPT |
+| **HOD** | **Only their own department** | Submit results (app or WhatsApp), answer Claude, update actions, propose KPIs |
+| **Viewer** | Everything | Read only |
+| **Pending** | Nothing | — |
 
-The week shown is the Monday of the meeting; it covers the previous Monday–Sunday.
+### Saturday timeline (India time)
+
+| Time | What happens |
+|---|---|
+| 9:30 AM | Bot sends every HOD the kickoff message on WhatsApp |
+| Any time | HOD replies START and answers each KPI; then Claude's Malayalam questions |
+| 1:30 PM | Reminder to HODs who haven't finished |
+| 4:30 PM | Claude writes the MD office review |
+| 5:00 PM | PowerPoint built, stored, and sent to the WhatsApp numbers in **Settings** |
+
+### WhatsApp commands
+
+HOD: `START` begin/continue · `SKIP` skip a question · `BACK` previous · `STATUS` progress · `STOP` pause · `RESTART` change answers · `HELP`
+Admin: `PPT` get this week's deck now · `STATUS` who has submitted
+
+---
+
+## Upgrading from version 1 (you already have the app on Vercel + Supabase)
+
+1. **Update the code on GitHub.** Replace the files in your repository with the ones in this zip (keep the folder structure: `src/`, `supabase/`, `index.html`, `package.json`). Vercel rebuilds by itself.
+2. **Update the database.** Supabase → SQL Editor → paste all of `supabase/schema.sql` → Run. It upgrades in place; your data stays.
+3. **Turn off email confirmation.** Supabase → Authentication → Sign In / Providers → Email: keep the Email provider **enabled** (usernames work through it behind the scenes) but turn **Confirm email** OFF. Under user sign-ups, turn **Allow new users to sign up** OFF (the admin creates every login).
+4. **Give yourself a username + password** (you signed in with an email before). SQL Editor → run this one line, with your old email, the username you want and a new password:
+   ```sql
+   select public.set_login('your-old-email@gmail.com', 'nowfal', 'YourNewPassword', 'admin');
+   ```
+   It answers *Done. Sign in with username "nowfal"…*. Sign in with that username + password. In **Users**, give every other person a username (anyone without one shows in red — they can't sign in), and add your own WhatsApp mobile.
+   *Logins made with a mobile number in version 2.0 are converted automatically: their username is their 10-digit mobile number. You can change it in Users.*
+5. Continue with **Functions**, **WhatsApp** and **Schedule** below.
+
+## Fresh install
+
+1. Create a Supabase project (region Mumbai). SQL Editor: run `supabase/schema.sql`, then `supabase/seed.sql`.
+2. Authentication → Email: **Confirm email** OFF, **Allow new users to sign up** OFF.
+3. Create your own admin login: Authentication → Users → **Add user** → email `setup@u.atlas-kpi.app`, any password, **Auto confirm** ON (this address is never emailed — it's only a placeholder). Then SQL Editor:
+   ```sql
+   select public.set_login('setup@u.atlas-kpi.app', 'nowfal', 'YourPassword', 'admin');
+   ```
+   Sign in with username `nowfal` + that password.
+4. Deploy the web app (Vercel or Netlify) with environment variables `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`.
+5. Continue below.
+
+## Functions (5)
+
+**Secrets** — Supabase → Edge Functions → Secrets:
+
+| Name | Value |
+|---|---|
+| `ANTHROPIC_API_KEY` | Claude API key (platform.claude.com) |
+| `WA_TOKEN` | WhatsApp permanent access token |
+| `WA_PHONE_NUMBER_ID` | WhatsApp sending number's ID |
+| `WA_VERIFY_TOKEN` | Any long random word you make up (used once to connect the webhook) |
+| `WA_APP_SECRET` | Meta app secret (App settings → Basic) — protects the webhook |
+| `CRON_SECRET` | Any long random word you make up (protects the Saturday schedule) |
+
+**Deploy** — either way:
+
+- *Website:* Edge Functions → Deploy a new function → Via Editor. Name it exactly as below, paste the matching file from `supabase/dashboard-paste/`, Deploy.
+- *Command line:* `npx supabase functions deploy <name>` (add `--no-verify-jwt` where shown).
+
+| Function | JWT verification |
+|---|---|
+| `ai-check` | ON (default) |
+| `ai-review` | ON (default) |
+| `admin-users` | ON (default) |
+| `weekly-jobs` | **OFF** — it checks `CRON_SECRET` or the admin login itself |
+| `whatsapp` | **OFF** — Meta can't send a Supabase login |
+
+On the website, JWT verification is the **Enforce JWT verification** switch in each function's settings.
+
+## WhatsApp (Meta Cloud API)
+
+You need a Meta Business account and a phone number that is **not** already used in the normal WhatsApp app.
+
+1. developers.facebook.com → **Create app** → Business → add **WhatsApp**.
+2. In WhatsApp → API Setup: add and verify your business number; copy its **Phone number ID** → secret `WA_PHONE_NUMBER_ID`.
+3. Business Settings → System users → create one (Admin) → **Generate token** for this app with `whatsapp_business_messaging` and `whatsapp_business_management` → secret `WA_TOKEN`.
+4. App settings → Basic → **App secret** → secret `WA_APP_SECRET`.
+5. WhatsApp → Configuration → **Webhook**: Callback URL `https://YOUR-PROJECT-REF.supabase.co/functions/v1/whatsapp`, Verify token = your `WA_VERIFY_TOKEN` → Verify and save → subscribe to **messages**.
+6. WhatsApp Manager → **Message templates** → create these two (category **Utility**, language **Malayalam**):
+
+**`kpi_weekly_start`** — Body:
+> നമസ്കാരം {{1}}, {{2}} വകുപ്പിന്റെ ഈ ആഴ്ചയിലെ KPI റിപ്പോർട്ട് ({{3}}) സമർപ്പിക്കാൻ സമയമായി. തുടങ്ങാൻ START എന്ന് മറുപടി അയക്കുക. ഇന്ന് വൈകിട്ട് 4:30-ന് മുമ്പ് പൂർത്തിയാക്കുക.
+
+Add a **Quick reply** button with the text `START`.
+
+**`kpi_weekly_report`** — Header: **Document**. Body:
+> ഈ ആഴ്ചയിലെ HOD റിവ്യൂ PPT ({{1}}) തയ്യാറായി. {{2}} വകുപ്പുകൾ സമർപ്പിച്ചു. ഫയൽ ചേർത്തിരിക്കുന്നു.
+
+Templates must be approved by Meta (usually minutes to a day). Business-started messages are charged by Meta per message; replies within 24 hours of the HOD's last message are part of the same conversation.
+
+7. In the app → **Users**: make sure every HOD has their WhatsApp mobile number. → **Settings**: add the numbers that get the Saturday PPT.
+8. Test: in **Settings → Run now → Send kickoff to all HODs**, then reply `START` from a HOD phone.
+
+## Schedule (Saturday automation)
+
+Supabase → SQL Editor → open `supabase/cron.sql`, replace `YOUR-PROJECT-REF` and `YOUR-CRON-SECRET`, Run.
+Check with `select jobname, schedule, active from cron.job;` — four jobs. Every run also shows in the app under **Settings → Recent runs**.
 
 ## Changing things later
 
-- **KRA / KPI:** in the app, **All KRA & KPI** (admin). Set **Target number** and **Better when** so achievement % is calculated; leave the number blank where the HOD should pick Green/Amber/Red.
-- **Claude's rules:** edit the prompt text in `supabase/functions/ai-check/index.ts` or `ai-review/index.ts`, then `supabase functions deploy ai-check` (or `ai-review`).
-- **Colours and fonts:** the tokens at the top of `src/styles.css`.
+| Change | Where |
+|---|---|
+| KRA / KPI / targets | App → KRA & KPI (admin) |
+| People, usernames, roles, WhatsApp numbers, passwords | App → Users (admin) |
+| PPT recipients, bot asks all or only ★ KPIs | App → Settings |
+| Saturday times | `supabase/cron.sql` (times are UTC = IST − 5:30) |
+| Claude's rules / Malayalam wording | `supabase/functions/_shared/ai.ts`, bot messages in `_shared/bot.ts` → redeploy (or rebuild `dashboard-paste` with `npm run bundle:functions`) |
+| PPT layout | `supabase/functions/_shared/ppt-builder.js` (used by app and Saturday job) |
 
-## Costs to expect
+## Troubleshooting
 
-Supabase and Netlify free plans cover a team of this size to start. Claude API usage is billed per
-use on your Anthropic account: one HOD check and one MD review per week is a small amount, but
-check current prices in the Claude Console and set a monthly spend limit there.
-
-## Good next steps
-
-1. **Pull actuals from Tally and the billing software** with a scheduled Edge Function, so the sheet
-   is filled from the system and HODs only add reasons — the strongest guard against overstated results.
-2. **WhatsApp / email reminders** on Saturday evening to HODs who haven't submitted.
-3. **Monthly roll-up** of weekly scores for the incentive scheme.
+| Problem | Fix |
+|---|---|
+| "Username or password is wrong" | Admin → Users → check the username, or Reset password |
+| Admin forgot own password | SQL Editor: `select public.set_login('nowfal', 'nowfal', 'NewPassword');` |
+| HOD sees nothing | Their role or department isn't set in Users |
+| Bot doesn't reply | Webhook not verified, `whatsapp` deployed with JWT ON, or the HOD's number in Users doesn't match their WhatsApp number |
+| Bot says number not registered | Add the number in Users (10 digits; 91 is added automatically) |
+| Kickoff / PPT not received | Template not approved yet, or template name/language in Settings doesn't match Meta |
+| Saturday jobs didn't run | `select * from cron.job_run_details order by start_time desc limit 10;` and Settings → Recent runs |
+| Claude errors | Edge Functions → (function) → Logs; check `ANTHROPIC_API_KEY` and Claude Console credit |
