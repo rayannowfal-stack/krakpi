@@ -41,6 +41,18 @@ export async function sendDocument(db: Db, to: string, link: string, filename: s
   if (db) await db.from("wa_log").insert({ phone: to, direction: "out", body: `[document ${filename}] ${caption}` });
 }
 
+/** Downloads a voice note / photo / document someone sent (Meta keeps it about 30 days). */
+export async function downloadMedia(mediaId: string): Promise<{ bytes: Uint8Array; mime: string }> {
+  const token = Deno.env.get("WA_TOKEN");
+  if (!token) throw new Error("WhatsApp is not set up: add the WA_TOKEN secret.");
+  const meta = await fetch(`${API()}/${mediaId}`, { headers: { Authorization: `Bearer ${token}` } });
+  const j = await meta.json().catch(() => ({}));
+  if (!meta.ok || !j.url) throw new Error("WhatsApp media lookup failed " + meta.status + ": " + JSON.stringify(j.error || j).slice(0, 200));
+  const file = await fetch(j.url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!file.ok) throw new Error("WhatsApp media download failed " + file.status);
+  return { bytes: new Uint8Array(await file.arrayBuffer()), mime: String(j.mime_type || file.headers.get("content-type") || "application/octet-stream").split(";")[0] };
+}
+
 /** Checks Meta's signature on incoming webhooks (when WA_APP_SECRET is set). */
 export async function validSignature(raw: string, header: string | null) {
   const secret = Deno.env.get("WA_APP_SECRET");

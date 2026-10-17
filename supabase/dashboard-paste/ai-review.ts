@@ -31,12 +31,18 @@ var HttpError = class extends Error {
   }
   status;
 };
+function claudeHeaders(key) {
+  const h = { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" };
+  const ws = Deno.env.get("ANTHROPIC_WORKSPACE_ID");
+  if (ws) h["anthropic-workspace-id"] = ws.trim();
+  return h;
+}
 async function askClaudeJson(prompt, opts) {
   const key = Deno.env.get("ANTHROPIC_API_KEY");
   if (!key) throw new HttpError(500, "Claude is not set up: add the ANTHROPIC_API_KEY secret in Supabase.");
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    headers: claudeHeaders(key),
     body: JSON.stringify({
       model: opts.model,
       max_tokens: opts.maxTokens,
@@ -48,7 +54,14 @@ async function askClaudeJson(prompt, opts) {
     console.error("Claude API error", res.status, detail);
     if (res.status === 429 || res.status === 529) throw new HttpError(503, "Claude is busy right now. Try again in a minute.");
     if (res.status === 401) throw new HttpError(500, "The Claude API key is not valid. Check the ANTHROPIC_API_KEY secret.");
-    throw new HttpError(502, "Claude could not answer. Try again.");
+    let why = "";
+    try {
+      why = JSON.parse(detail)?.error?.message ?? "";
+    } catch (_) {
+    }
+    if (/workspace/i.test(why)) throw new HttpError(500, "The Claude API key is not linked to a workspace. Make a new key inside a workspace (platform.claude.com \u2192 API Keys) and save it as ANTHROPIC_API_KEY.");
+    if (/credit balance/i.test(why)) throw new HttpError(500, "Claude API credit is used up. Add credit at platform.claude.com \u2192 Billing.");
+    throw new HttpError(502, "Claude could not answer" + (why ? ": " + why.slice(0, 200) : ". Try again."));
   }
   const data = await res.json();
   const text = (data.content ?? []).filter((b) => b.type === "text").map((b) => b.text).join("");
@@ -103,23 +116,28 @@ function istToday(now = /* @__PURE__ */ new Date()) {
 }
 var weekRange = (w) => `${fmtShort(addDays(w, -7))} \u2013 ${fmtShort(addDays(w, -2))}`;
 var ragOf = (ach) => ach == null ? "" : ach >= 95 ? "G" : ach >= 80 ? "A" : "R";
+var statusOf = (r) => ragOf(r && typeof r.ach === "number" ? r.ach : null);
+var filesOf = (r) => r && Array.isArray(r.files) ? r.files : [];
+var kindOf = (mime) => /^audio\//.test(mime || "") ? "voice" : /^image\//.test(mime || "") ? "photo" : "file";
+function filesSummary(r) {
+  const c = { voice: 0, photo: 0, file: 0 };
+  filesOf(r).forEach((f) => {
+    c[f.kind || kindOf(f.type)]++;
+  });
+  const out = [];
+  if (c.voice) out.push(`${c.voice} voice note${c.voice > 1 ? "s" : ""}`);
+  if (c.photo) out.push(`${c.photo} photo${c.photo > 1 ? "s" : ""}`);
+  if (c.file) out.push(`${c.file} file${c.file > 1 ? "s" : ""}`);
+  return out.join(", ");
+}
 function summarize(rows) {
   const c = { G: 0, A: 0, R: 0 };
   let sum = 0, n = 0;
   for (const r of Object.values(rows || {})) {
-    const rag = r.rag || ragOf(r.ach);
+    const rag = statusOf(r);
     if (c[rag] != null) c[rag]++;
     if (typeof r.ach === "number") {
       sum += Math.min(r.ach, 120);
-      n++;
-    } else if (rag === "G") {
-      sum += 100;
-      n++;
-    } else if (rag === "A") {
-      sum += 87;
-      n++;
-    } else if (rag === "R") {
-      sum += 60;
       n++;
     }
   }
@@ -172,7 +190,7 @@ function repeatReds(depts, results, prev) {
     if (!r || !p) return;
     for (const [id, x] of Object.entries(r.rows || {})) {
       const y = (p.rows || {})[id];
-      if (y && (x.rag || ragOf(x.ach)) === "R" && (y.rag || ragOf(y.ach)) === "R") out.push({ dept: d.id, name: d.name, no: x.no, text: x.text });
+      if (y && statusOf(x) === "R" && statusOf(y) === "R") out.push({ dept: d.id, name: d.name, no: x.no, text: x.text });
     }
   });
   return out;
@@ -190,7 +208,7 @@ function reviewDepartments({ depts, results, prev, actions, today }) {
       score: r ? summarize(r.rows).score : null,
       lastWeekScore: p ? summarize(p.rows).score : null,
       claudeCheck: r && r.ai ? { rating: r.ai.rating, evidenceScore: r.ai.score, summary: r.ai.summary } : null,
-      rows: r ? Object.values(r.rows || {}).map((x) => ({ no: x.no, kpi: x.text, target: x.target, actual: x.actual, ach: x.ach, status: RAGN[x.rag || ragOf(x.ach)] || "", reason: x.reason, data: x.data })) : [],
+      rows: r ? Object.values(r.rows || {}).map((x) => ({ no: x.no, kpi: x.text, target: x.target, actual: x.actual, ach: x.ach, status: RAGN[statusOf(x)] || "", reason: x.reason, data: x.data, nextStep: x.next || "", attached: filesSummary(x) })) : [],
       clarifications: r ? [...r.clar || [], ...r.ai && r.ai.flags || []].map((c) => ({ kpi: c.kpiNo, q: c.question, a: c.answer || "NOT ANSWERED" })) : [],
       priorities: r ? (r.priorities || []).filter(Boolean) : [],
       support: r ? r.support : "",
@@ -238,7 +256,7 @@ async function reviewWeek(b) {
 
 For each department judge:
 - Are results measured outcomes against targets with real data, or activity reports ("done", "checked", "followed up")?
-- Are Amber/Red KPIs explained with a root cause and a corrective action with owner and date?
+- Are Amber/Red KPIs explained with a root cause ("reason") and a concrete "nextStep" with owner and date? ("attached" = voice notes/photos/files given as evidence; you cannot open them.)
 - Did the HOD answer Claude's clarification questions properly, or dodge them? (Answers may be in Malayalam.)
 - Trend vs last week's score, overdue actions, KPIs Red two weeks running.
 - A department with a missing sheet should be called out.

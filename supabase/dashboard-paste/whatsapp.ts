@@ -12,12 +12,18 @@ var HttpError = class extends Error {
   }
   status;
 };
+function claudeHeaders(key) {
+  const h = { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" };
+  const ws = Deno.env.get("ANTHROPIC_WORKSPACE_ID");
+  if (ws) h["anthropic-workspace-id"] = ws.trim();
+  return h;
+}
 async function askClaudeJson(prompt, opts) {
   const key = Deno.env.get("ANTHROPIC_API_KEY");
   if (!key) throw new HttpError(500, "Claude is not set up: add the ANTHROPIC_API_KEY secret in Supabase.");
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    headers: claudeHeaders(key),
     body: JSON.stringify({
       model: opts.model,
       max_tokens: opts.maxTokens,
@@ -29,7 +35,14 @@ async function askClaudeJson(prompt, opts) {
     console.error("Claude API error", res.status, detail);
     if (res.status === 429 || res.status === 529) throw new HttpError(503, "Claude is busy right now. Try again in a minute.");
     if (res.status === 401) throw new HttpError(500, "The Claude API key is not valid. Check the ANTHROPIC_API_KEY secret.");
-    throw new HttpError(502, "Claude could not answer. Try again.");
+    let why = "";
+    try {
+      why = JSON.parse(detail)?.error?.message ?? "";
+    } catch (_) {
+    }
+    if (/workspace/i.test(why)) throw new HttpError(500, "The Claude API key is not linked to a workspace. Make a new key inside a workspace (platform.claude.com \u2192 API Keys) and save it as ANTHROPIC_API_KEY.");
+    if (/credit balance/i.test(why)) throw new HttpError(500, "Claude API credit is used up. Add credit at platform.claude.com \u2192 Billing.");
+    throw new HttpError(502, "Claude could not answer" + (why ? ": " + why.slice(0, 200) : ". Try again."));
   }
   const data = await res.json();
   const text = (data.content ?? []).filter((b) => b.type === "text").map((b) => b.text).join("");
@@ -78,6 +91,16 @@ async function sendTemplate(db, to, name, lang, bodyParams, headerDoc) {
   if (bodyParams.length) components.push({ type: "body", parameters: bodyParams.map((t) => ({ type: "text", text: t })) });
   await post({ to, type: "template", template: { name, language: { code: lang }, components } });
   if (db) await db.from("wa_log").insert({ phone: to, direction: "out", body: `[template ${name}] ${bodyParams.join(" | ")}${headerDoc ? " + " + headerDoc.filename : ""}` });
+}
+async function downloadMedia(mediaId) {
+  const token = Deno.env.get("WA_TOKEN");
+  if (!token) throw new Error("WhatsApp is not set up: add the WA_TOKEN secret.");
+  const meta = await fetch(`${API()}/${mediaId}`, { headers: { Authorization: `Bearer ${token}` } });
+  const j = await meta.json().catch(() => ({}));
+  if (!meta.ok || !j.url) throw new Error("WhatsApp media lookup failed " + meta.status + ": " + JSON.stringify(j.error || j).slice(0, 200));
+  const file = await fetch(j.url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!file.ok) throw new Error("WhatsApp media download failed " + file.status);
+  return { bytes: new Uint8Array(await file.arrayBuffer()), mime: String(j.mime_type || file.headers.get("content-type") || "application/octet-stream").split(";")[0] };
 }
 async function validSignature(raw, header) {
   const secret = Deno.env.get("WA_APP_SECRET");
@@ -141,34 +164,40 @@ function calcAch(item, actual) {
 }
 var ragOf = (ach) => ach == null ? "" : ach >= 95 ? "G" : ach >= 80 ? "A" : "R";
 var isManual = (item) => item.tv == null && item.dir !== "zero";
+var statusOf = (r) => ragOf(r && typeof r.ach === "number" ? r.ach : null);
+var filesOf = (r) => r && Array.isArray(r.files) ? r.files : [];
+var KIND_ML = { voice: "\u0D36\u0D2C\u0D4D\u0D26 \u0D38\u0D28\u0D4D\u0D26\u0D47\u0D36\u0D02", photo: "\u0D2B\u0D4B\u0D1F\u0D4D\u0D1F\u0D4B", file: "\u0D2B\u0D2F\u0D7D" };
+var kindOf = (mime) => /^audio\//.test(mime || "") ? "voice" : /^image\//.test(mime || "") ? "photo" : "file";
+function filesSummary(r) {
+  const c = { voice: 0, photo: 0, file: 0 };
+  filesOf(r).forEach((f) => {
+    c[f.kind || kindOf(f.type)]++;
+  });
+  const out = [];
+  if (c.voice) out.push(`${c.voice} voice note${c.voice > 1 ? "s" : ""}`);
+  if (c.photo) out.push(`${c.photo} photo${c.photo > 1 ? "s" : ""}`);
+  if (c.file) out.push(`${c.file} file${c.file > 1 ? "s" : ""}`);
+  return out.join(", ");
+}
 function summarize(rows) {
   const c = { G: 0, A: 0, R: 0 };
   let sum = 0, n = 0;
   for (const r of Object.values(rows || {})) {
-    const rag = r.rag || ragOf(r.ach);
+    const rag = statusOf(r);
     if (c[rag] != null) c[rag]++;
     if (typeof r.ach === "number") {
       sum += Math.min(r.ach, 120);
-      n++;
-    } else if (rag === "G") {
-      sum += 100;
-      n++;
-    } else if (rag === "A") {
-      sum += 87;
-      n++;
-    } else if (rag === "R") {
-      sum += 60;
       n++;
     }
   }
   const score = n ? Math.round(sum / n) : null;
   return { score, counts: c, rag: score == null ? "none" : ragOf(score) };
 }
-var hasValue = (r) => !!r && !!(r.actual || r.rag || r.reason || r.data || r.ach != null);
+var hasValue = (r) => !!r && !!(r.actual || r.reason || r.data || r.next || r.ach != null || filesOf(r).length);
 function rowsHash(rows) {
   return Object.keys(rows || {}).sort().map((k) => {
     const r = rows[k];
-    return [k, r.actual ?? "", r.ach ?? "", r.rag || "", r.reason || "", r.data || ""].join("|");
+    return [k, r.actual ?? "", r.ach ?? "", r.reason || "", r.data || "", r.next || "", filesOf(r).map((f) => f.path).join(",")].join("|");
   }).join("~");
 }
 function sortItems(items) {
@@ -223,7 +252,7 @@ function repeatReds(depts, results, prev) {
     if (!r || !p) return;
     for (const [id, x] of Object.entries(r.rows || {})) {
       const y = (p.rows || {})[id];
-      if (y && (x.rag || ragOf(x.ach)) === "R" && (y.rag || ragOf(y.ach)) === "R") out.push({ dept: d.id, name: d.name, no: x.no, text: x.text });
+      if (y && statusOf(x) === "R" && statusOf(y) === "R") out.push({ dept: d.id, name: d.name, no: x.no, text: x.text });
     }
   });
   return out;
@@ -233,7 +262,7 @@ function checkRows(dept, rows) {
   for (const i of dept && dept.items || []) {
     const r = rows[i.id];
     if (!hasValue(r)) continue;
-    out.push({ no: i.no, kpi: i.text, target: i.target, freq: FREQ[i.freq] || i.freq, headline: !!i.star, actual: r.actual || "", achievement: r.ach != null ? r.ach + "%" : "", status: RAGN[r.rag || ragOf(r.ach)] || "", reason: r.reason || "", data: r.data || "" });
+    out.push({ no: i.no, kpi: i.text, target: i.target, freq: FREQ[i.freq] || i.freq, headline: !!i.star, actual: r.actual || "", achievement: r.ach != null ? r.ach + "%" : "", status: RAGN[statusOf(r)] || "", reason: r.reason || "", data: r.data || "", nextStep: r.next || "", attached: filesSummary(r) });
   }
   return out;
 }
@@ -253,7 +282,7 @@ function reviewDepartments({ depts, results, prev, actions, today }) {
       score: r ? summarize(r.rows).score : null,
       lastWeekScore: p ? summarize(p.rows).score : null,
       claudeCheck: r && r.ai ? { rating: r.ai.rating, evidenceScore: r.ai.score, summary: r.ai.summary } : null,
-      rows: r ? Object.values(r.rows || {}).map((x) => ({ no: x.no, kpi: x.text, target: x.target, actual: x.actual, ach: x.ach, status: RAGN[x.rag || ragOf(x.ach)] || "", reason: x.reason, data: x.data })) : [],
+      rows: r ? Object.values(r.rows || {}).map((x) => ({ no: x.no, kpi: x.text, target: x.target, actual: x.actual, ach: x.ach, status: RAGN[statusOf(x)] || "", reason: x.reason, data: x.data, nextStep: x.next || "", attached: filesSummary(x) })) : [],
       clarifications: r ? [...r.clar || [], ...r.ai && r.ai.flags || []].map((c) => ({ kpi: c.kpiNo, q: c.question, a: c.answer || "NOT ANSWERED" })) : [],
       priorities: r ? (r.priorities || []).filter(Boolean) : [],
       support: r ? r.support : "",
@@ -269,8 +298,10 @@ async function checkSheet(b, maxFlags = 8) {
 How to judge each row:
 - Result-oriented: a measured outcome against the target (a number, %, or "X out of Y"), backed by verifiable supporting data (count, source report, list).
 - Activity only: says work was "done", "checked", "followed up", "ongoing", or claims 100% / Green without saying what was measured or how.
-- Every Amber or Red row needs a root cause and a corrective action (what, who, by when).
-- Flag inconsistencies: status not matching actual vs target, 100% or Green with no data, figures that cannot be right for the target, headline KPIs left blank.
+- Every Amber or Red row needs a root cause ("reason") and a "nextStep" (what, who, by when). A vague next step ("will improve", "will follow up") is not enough \u2014 ask for the concrete action.
+- Status is calculated automatically from the achievement %, so never question the colour itself; question the figure or the evidence behind it.
+- "attached" lists voice notes / photos / files the HOD attached as evidence. You cannot open them: count them as supporting evidence that exists, do not ask for proof that is already attached, but still ask what they show if the written reason is empty.
+- Flag inconsistencies: 100% or Green with no data or evidence, figures that cannot be right for the target, headline KPIs left blank.
 - Next week's priorities should each name an expected number.
 - If the HOD already answered a question well (see earlier answers), do not ask it again.
 Never invent figures.
@@ -308,7 +339,7 @@ async function reviewWeek(b) {
 
 For each department judge:
 - Are results measured outcomes against targets with real data, or activity reports ("done", "checked", "followed up")?
-- Are Amber/Red KPIs explained with a root cause and a corrective action with owner and date?
+- Are Amber/Red KPIs explained with a root cause ("reason") and a concrete "nextStep" with owner and date? ("attached" = voice notes/photos/files given as evidence; you cannot open them.)
 - Did the HOD answer Claude's clarification questions properly, or dodge them? (Answers may be in Malayalam.)
 - Trend vs last week's score, overdue actions, KPIs Red two weeks running.
 - A department with a missing sheet should be called out.
@@ -349,6 +380,15 @@ var TXT = "13262B";
 var RED = "B23434";
 var RC = { G: ["DDF0E4", "25734A"], A: ["F8E9CC", "9A6412"], R: ["F7DEDC", "B23434"], NA: ["E4E9E8", "6B7779"], none: ["E4E9E8", "6B7779"], "": ["FFFFFF", "5A6B6F"] };
 var FONT = "Calibri";
+function whyCell(x) {
+  const parts = [];
+  if (x.reason) parts.push(x.reason);
+  if (x.next) parts.push("Next: " + x.next);
+  if (x.data) parts.push(x.data);
+  const f = filesSummary(x);
+  if (f) parts.push("\u{1F4CE} " + f);
+  return parts.join(" \xB7 ");
+}
 function buildDeck(PptxGenJS2, d) {
   const { week, depts, results, actions, review: review2, today } = d;
   const pptx = new PptxGenJS2();
@@ -448,7 +488,7 @@ function buildDeck(PptxGenJS2, d) {
       s.addText("Results not submitted for this week.", { x: 0.5, y: 2.5, w: 12.3, h: 1, fontSize: 24, color: RED, bold: true, align: "center", fontFace: FONT });
       return;
     }
-    const rows = Object.entries(r.rows || {}).map(([id, x]) => ({ id, ...x, rag: x.rag || ragOf(x.ach) })).sort((a, b) => order[a.rag] - order[b.rag] || (b.star ? 1 : 0) - (a.star ? 1 : 0) || String(a.no).localeCompare(String(b.no), void 0, { numeric: true }));
+    const rows = Object.entries(r.rows || {}).map(([id, x]) => ({ id, ...x, rag: statusOf(x) })).sort((a, b) => order[a.rag] - order[b.rag] || (b.star ? 1 : 0) - (a.star ? 1 : 0) || String(a.no).localeCompare(String(b.no), void 0, { numeric: true }));
     const per = 9;
     const pages = Math.max(1, Math.ceil(rows.length / per));
     for (let p = 0; p < pages; p++) {
@@ -458,8 +498,8 @@ function buildDeck(PptxGenJS2, d) {
         `${dp.name} \u2014 ${sm.score != null ? sm.score + "%" : "\u2014"} ${sm.rag !== "none" ? "\xB7 " + RAGN[sm.rag] : ""}`,
         `HOD ${dp.hod || ""} \xB7 ${sm.counts.G} Green, ${sm.counts.A} Amber, ${sm.counts.R} Red${r.status !== "submitted" ? " \xB7 DRAFT, not submitted" : ""}${r.source === "whatsapp" ? " \xB7 via WhatsApp" : ""}${pages > 1 ? ` \xB7 page ${p + 1} of ${pages}` : ""}`
       );
-      const tr = [[H(""), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Status"), H("Reason / data")]];
-      rows.slice(p * per, p * per + per).forEach((x) => tr.push([x.star ? { text: "\u2605", options: { color: GOLD, align: "center" } } : "", x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "\u2014", ragCell(x.rag), [x.reason, x.data].filter(Boolean).join(" \xB7 ")]));
+      const tr = [[H(""), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Status"), H("Reason \xB7 next step \xB7 evidence")]];
+      rows.slice(p * per, p * per + per).forEach((x) => tr.push([x.star ? { text: "\u2605", options: { color: GOLD, align: "center" } } : "", x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "\u2014", ragCell(x.rag), whyCell(x)]));
       if (tr.length === 1) tr.push(["", "", "No KPI rows entered", "", "", "", "", ""]);
       s.addTable(tr, tblOpts([0.35, 0.6, 4.1, 1.35, 1, 0.8, 0.95, 3.18]));
     }
@@ -510,13 +550,13 @@ function buildDeck(PptxGenJS2, d) {
     const r = results[dp.id];
     if (!r) return;
     Object.values(r.rows || {}).forEach((x) => {
-      if ((x.rag || ragOf(x.ach)) === "R") reds.push([dp.name, x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "\u2014", x.reason || ""]);
+      if (statusOf(x) === "R") reds.push([dp.name, x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "\u2014", whyCell(x)]);
     });
   });
   for (let p = 0; p < Math.max(1, Math.ceil(reds.length / 10)); p++) {
     const s = pptx.addSlide({ masterName: "M" });
     head(s, "Red KPIs across the group", reds.length ? `${reds.length} KPIs below 80% of target \u2014 each needs an owner, action and date` : "No Red KPIs reported this week");
-    if (reds.length) s.addTable([[H("Department"), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Reason")], ...reds.slice(p * 10, p * 10 + 10)], tblOpts([1.8, 0.6, 4, 1.4, 1, 0.8, 2.73]));
+    if (reds.length) s.addTable([[H("Department"), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Reason \xB7 next step")], ...reds.slice(p * 10, p * 10 + 10)], tblOpts([1.8, 0.6, 4, 1.4, 1, 0.8, 2.73]));
   }
   const acts = actions.filter((a) => a.status !== "Done").sort((a, b) => (a.due || "9999").localeCompare(b.due || "9999"));
   for (let p = 0; p < Math.max(1, Math.ceil(acts.length / 11)); p++) {
@@ -628,14 +668,12 @@ var WORDS = {
   none: ["no", "nil", "none", "\u0D07\u0D32\u0D4D\u0D32", "\u0D35\u0D47\u0D23\u0D4D\u0D1F", "na", "n/a"]
 };
 var is = (t, k) => WORDS[k].includes(t);
-var RAG_WORDS = { g: "G", green: "G", "\u0D2A\u0D1A\u0D4D\u0D1A": "G", a: "A", amber: "A", "\u0D2E\u0D1E\u0D4D\u0D1E": "A", r: "R", red: "R", "\u0D1A\u0D41\u0D35\u0D2A\u0D4D\u0D2A\u0D4D": "R" };
+var RAG_WORDS = /* @__PURE__ */ new Set(["g", "green", "\u0D2A\u0D1A\u0D4D\u0D1A", "a", "amber", "\u0D2E\u0D1E\u0D4D\u0D1E", "r", "red", "\u0D1A\u0D41\u0D35\u0D2A\u0D4D\u0D2A\u0D4D"]);
 var HELP = "*\u0D38\u0D39\u0D3E\u0D2F\u0D02*\nSTART \u2013 \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D24\u0D41\u0D1F\u0D19\u0D4D\u0D19\u0D3E\u0D7B / \u0D24\u0D41\u0D1F\u0D30\u0D3E\u0D7B\nSKIP \u2013 \u0D08 \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D02 \u0D12\u0D34\u0D3F\u0D35\u0D3E\u0D15\u0D4D\u0D15\u0D3E\u0D7B\nBACK \u2013 \u0D2E\u0D41\u0D2E\u0D4D\u0D2A\u0D24\u0D4D\u0D24\u0D46 \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D02\nSTATUS \u2013 \u0D0E\u0D24\u0D4D\u0D30 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F\nSTOP \u2013 \u0D2A\u0D3F\u0D28\u0D4D\u0D28\u0D40\u0D1F\u0D4D \u0D24\u0D41\u0D1F\u0D30\u0D3E\u0D7B\nRESTART \u2013 \u0D06\u0D26\u0D4D\u0D2F\u0D02 \u0D2E\u0D41\u0D24\u0D7D \u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D3E\u0D7B";
 function parseAnswer(text, manual) {
   const t = text.trim();
   const first = t.split(/[\s,.:;\-]+/)[0].toLowerCase();
-  if (manual && RAG_WORDS[first]) {
-    return { kind: "rag", rag: RAG_WORDS[first], note: t.slice(t.split(/[\s,.:;\-]+/)[0].length).replace(/^[\s,.:;\-]+/, "").trim() };
-  }
+  if (RAG_WORDS.has(first)) return { kind: "colour" };
   const m = t.replace(/rs\.?\s*/ig, "").match(/-?\d[\d,]*(\.\d+)?/);
   if (!m) return { kind: "none" };
   const value = m[0].replace(/,/g, "");
@@ -647,15 +685,20 @@ function askKpi(item, i, n, row) {
 ${item.text}
 \u0D32\u0D15\u0D4D\u0D37\u0D4D\u0D2F\u0D02: ${item.target} (${FREQ_ML[item.freq] || item.freq})`;
   if (hasValue(row)) s += `
-\u0D07\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E: ${row.actual || (row.ach != null ? row.ach + "%" : RAG_ML[row.rag] || "")} \u2014 \u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D2E\u0D3F\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D SKIP`;
-  s += isManual(item) ? "\n\n\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D2B\u0D32\u0D02 \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15: % (\u0D09\u0D26\u0D3E: 92) \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D G / A / R. \u0D15\u0D42\u0D1F\u0D46 \u0D21\u0D3E\u0D31\u0D4D\u0D31 \u0D0E\u0D34\u0D41\u0D24\u0D3E\u0D02." : "\n\n\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D2F\u0D25\u0D3E\u0D7C\u0D24\u0D4D\u0D25 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15. \u0D15\u0D42\u0D1F\u0D46 \u0D21\u0D3E\u0D31\u0D4D\u0D31 \u0D0E\u0D34\u0D41\u0D24\u0D3E\u0D02 (\u0D09\u0D26\u0D3E: 1420, billing report).";
+\u0D07\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E: ${row.actual || (row.ach != null ? row.ach + "%" : "")}${filesOf(row).length ? " \xB7 \u{1F4CE} " + filesOf(row).length : ""} \u2014 \u0D2E\u0D3E\u0D31\u0D4D\u0D31\u0D2E\u0D3F\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D SKIP`;
+  s += isManual(item) ? "\n\n\u0D0E\u0D24\u0D4D\u0D30 \u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F \u0D0E\u0D28\u0D4D\u0D28\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 92). \u0D15\u0D42\u0D1F\u0D46 \u0D21\u0D3E\u0D31\u0D4D\u0D31 \u0D0E\u0D34\u0D41\u0D24\u0D3E\u0D02. \u0D28\u0D3F\u0D31\u0D02 (Green/Amber/Red) \u0D24\u0D28\u0D3F\u0D2F\u0D46 \u0D35\u0D30\u0D41\u0D02." : "\n\n\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D2F\u0D25\u0D3E\u0D7C\u0D24\u0D4D\u0D25 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15. \u0D15\u0D42\u0D1F\u0D46 \u0D21\u0D3E\u0D31\u0D4D\u0D31 \u0D0E\u0D34\u0D41\u0D24\u0D3E\u0D02 (\u0D09\u0D26\u0D3E: 1420, billing report).";
+  s += "\n\u0D24\u0D46\u0D33\u0D3F\u0D35\u0D3E\u0D2F\u0D3F \u0D2B\u0D4B\u0D1F\u0D4D\u0D1F\u0D4B / \u0D36\u0D2C\u0D4D\u0D26 \u0D38\u0D28\u0D4D\u0D26\u0D47\u0D36\u0D02 / \u0D21\u0D4B\u0D15\u0D4D\u0D2F\u0D41\u0D2E\u0D46\u0D28\u0D4D\u0D31\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D3E\u0D02.";
   return s;
 }
 var askFlag = (f, i, n) => `*Claude-\u0D28\u0D4D\u0D31\u0D46 \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D02 ${i + 1}/${n}*${f.kpiNo ? " \xB7 KPI " + f.kpiNo : ""}${f.severity === "high" ? " (\u0D2E\u0D31\u0D41\u0D2A\u0D1F\u0D3F \u0D28\u0D3F\u0D7C\u0D2C\u0D28\u0D4D\u0D27\u0D02)" : ""}
 ${f.question}`;
+var ASK_REASON = (no, rag) => `KPI ${no}: ${RAG_ML[rag] || ""}
+*\u0D15\u0D3E\u0D30\u0D23\u0D02* \u0D0E\u0D28\u0D4D\u0D24\u0D3E\u0D23\u0D4D? \u0D1F\u0D48\u0D2A\u0D4D\u0D2A\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D2F\u0D41\u0D15, \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D36\u0D2C\u0D4D\u0D26 \u0D38\u0D28\u0D4D\u0D26\u0D47\u0D36\u0D02 / \u0D2B\u0D4B\u0D1F\u0D4D\u0D1F\u0D4B / \u0D21\u0D4B\u0D15\u0D4D\u0D2F\u0D41\u0D2E\u0D46\u0D28\u0D4D\u0D31\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`;
+var ASK_NEXT = (no) => `KPI ${no}: *\u0D05\u0D1F\u0D41\u0D24\u0D4D\u0D24 \u0D28\u0D1F\u0D2A\u0D1F\u0D3F* \u0D0E\u0D28\u0D4D\u0D24\u0D3E\u0D23\u0D4D? (\u0D0E\u0D28\u0D4D\u0D24\u0D4D, \u0D06\u0D30\u0D4D, \u0D0E\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E)
+\u0D09\u0D26\u0D3E: Perumbavoor-\u0D7D 2 staff \u0D15\u0D42\u0D1F\u0D3F, Manager Rajesh, 25 Oct-\u0D28\u0D15\u0D02`;
 var ASK_PRI = "*\u0D05\u0D1F\u0D41\u0D24\u0D4D\u0D24 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 3 \u0D2A\u0D4D\u0D30\u0D27\u0D3E\u0D28 \u0D2E\u0D41\u0D7B\u0D17\u0D23\u0D28\u0D15\u0D7E*\n\u0D13\u0D30\u0D4B\u0D28\u0D4D\u0D28\u0D41\u0D02 \u0D2A\u0D4D\u0D30\u0D24\u0D40\u0D15\u0D4D\u0D37\u0D3F\u0D15\u0D4D\u0D15\u0D41\u0D28\u0D4D\u0D28 \u0D28\u0D2E\u0D4D\u0D2A\u0D31\u0D4B\u0D1F\u0D46, \u0D13\u0D30\u0D4B \u0D35\u0D30\u0D3F\u0D2F\u0D3F\u0D7D \u0D12\u0D28\u0D4D\u0D28\u0D4D.\n\u0D09\u0D26\u0D3E: Perumbavoor conversion 75% \u0D06\u0D15\u0D4D\u0D15\u0D41\u0D15";
 var ASK_SUP = "*\u0D38\u0D39\u0D3E\u0D2F\u0D02 \u0D35\u0D47\u0D23\u0D4B?*\nCEO-\u0D2F\u0D3F\u0D7D \u0D28\u0D3F\u0D28\u0D4D\u0D28\u0D4B \u0D2E\u0D31\u0D4D\u0D31\u0D4D \u0D35\u0D15\u0D41\u0D2A\u0D4D\u0D2A\u0D41\u0D15\u0D33\u0D3F\u0D7D \u0D28\u0D3F\u0D28\u0D4D\u0D28\u0D4B \u0D0E\u0D28\u0D4D\u0D24\u0D4D \u0D38\u0D39\u0D3E\u0D2F\u0D02 \u0D35\u0D47\u0D23\u0D02? \u0D07\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u2018\u0D07\u0D32\u0D4D\u0D32\u2019 \u0D0E\u0D28\u0D4D\u0D28\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.";
-async function handleMessage(db, profile, textIn) {
+async function handleMessage(db, profile, textIn, media = null) {
   const text = (textIn || "").trim();
   const cmd = text.toLowerCase();
   const reply = (s2) => sendText(db, profile.phone, s2);
@@ -719,6 +762,40 @@ ${lines.join("\n")}`);
     s.updated_at = (/* @__PURE__ */ new Date()).toISOString();
     await db.from("wa_sessions").upsert({ phone: profile.phone, user_id: profile.id, dept_id: profile.dept_id, week, step: s.step, idx: s.idx, items: s.items, sub: s.sub ?? null, updated_at: s.updated_at });
   };
+  const storeMedia = async (folder) => {
+    const m = media;
+    const { bytes, mime } = await downloadMedia(m.id);
+    if (bytes.length > 16 * 1024 * 1024) throw new Error("file too big");
+    const type = mime || m.mime || "application/octet-stream";
+    const kind = m.voice ? "voice" : kindOf(type);
+    const ext = (type.split("/")[1] || "bin").replace(/[^a-z0-9]/gi, "").slice(0, 5) || "bin";
+    const name = (m.filename || `${kind}-whatsapp.${ext}`).replace(/[^\w.\-]+/g, "_").slice(-60);
+    const path = `${week}/${profile.dept_id}/${folder}/${Date.now()}-${name}`;
+    const up = await db.storage.from("evidence").upload(path, bytes, { contentType: type, upsert: false });
+    if (up.error) throw new Error(up.error.message);
+    return { path, name, type, size: bytes.length, kind, at: (/* @__PURE__ */ new Date()).toISOString(), via: "whatsapp" };
+  };
+  const attach = async (kpiId) => {
+    const meta = await storeMedia(kpiId);
+    const it = byId[kpiId];
+    const base = it ? { no: it.no, text: it.text, target: it.target, star: !!it.star, kraNo: it.kraNo, freq: it.freq } : {};
+    const old = res.rows[kpiId] || { actual: "", ach: null };
+    res.rows[kpiId] = { ...old, ...base, files: [...filesOf(old), meta] };
+    await save();
+    return meta.kind;
+  };
+  const attachOrSay = async (kpiId, flag) => {
+    try {
+      if (kpiId) return await attach(kpiId);
+      const meta = await storeMedia("_general");
+      if (flag) flag.files = [...flag.files || [], meta];
+      return meta.kind;
+    } catch (e) {
+      console.error("attach failed", e);
+      await reply("\u0D2B\u0D2F\u0D7D \u0D38\u0D47\u0D35\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D2F\u0D3E\u0D28\u0D3E\u0D2F\u0D3F\u0D32\u0D4D\u0D32. \u0D35\u0D40\u0D23\u0D4D\u0D1F\u0D41\u0D02 \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15, \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D1F\u0D48\u0D2A\u0D4D\u0D2A\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D2F\u0D41\u0D15.");
+      return null;
+    }
+  };
   const start = async (fromBeginning) => {
     const st = await getSettings(db);
     let items = itemsFor(dept, false);
@@ -754,8 +831,8 @@ SKIP \xB7 BACK \xB7 STOP \xB7 HELP`);
         s.idx++;
         return askCurrent();
       }
-      if (s.sub === "reason") return reply(`KPI ${it.no}: ${RAG_ML[res.rows[it.id]?.rag || ragOf(res.rows[it.id]?.ach)] || ""}
-\u0D15\u0D3E\u0D30\u0D23\u0D35\u0D41\u0D02 \u0D2A\u0D30\u0D3F\u0D39\u0D3E\u0D30 \u0D28\u0D1F\u0D2A\u0D1F\u0D3F\u0D2F\u0D41\u0D02 (\u0D0E\u0D28\u0D4D\u0D24\u0D4D, \u0D06\u0D30\u0D4D, \u0D0E\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E) \u0D0E\u0D34\u0D41\u0D24\u0D41\u0D15.`);
+      if (s.sub === "reason") return reply(ASK_REASON(it.no, statusOf(res.rows[it.id])));
+      if (s.sub === "next") return reply(ASK_NEXT(it.no));
       return reply(askKpi(it, s.idx, s.items.length, res.rows[it.id]));
     }
     if (s.step === "priorities") return reply(ASK_PRI);
@@ -855,18 +932,56 @@ ${done}/${items.length} KPI \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D
       return askCurrent();
     }
     if (s.sub === "reason") {
+      if (media) {
+        const kind = await attachOrSay(id);
+        if (!kind) return;
+        if (text) res.rows[id] = { ...res.rows[id], reason: text };
+        else if (!(res.rows[id].reason || "").trim()) res.rows[id] = { ...res.rows[id], reason: `(${KIND_ML[kind]} \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41)` };
+        await save();
+        s.sub = "next";
+        await saveSession();
+        return reply(`\u{1F4CE} ${KIND_ML[kind]} KPI ${it.no}-\u0D7D \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41.
+
+${ASK_NEXT(it.no)}`);
+      }
       if (is(cmd, "skip")) {
-        s.sub = null;
-        s.idx++;
+        s.sub = "next";
         await saveSession();
         return askCurrent();
       }
       res.rows[id] = { ...res.rows[id], reason: text };
       await save();
+      s.sub = "next";
+      await saveSession();
+      return askCurrent();
+    }
+    if (s.sub === "next") {
+      if (media) {
+        const kind = await attachOrSay(id);
+        if (!kind) return;
+        res.rows[id] = { ...res.rows[id], next: text || `(${KIND_ML[kind]} \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41)` };
+        await save();
+      } else if (!is(cmd, "skip")) {
+        res.rows[id] = { ...res.rows[id], next: text };
+        await save();
+      }
       s.sub = null;
       s.idx++;
       await saveSession();
+      await reply(`\u2713 KPI ${it.no} \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F.`);
       return askCurrent();
+    }
+    if (media) {
+      const kind = await attachOrSay(id);
+      if (!kind) return;
+      if (text) {
+        const a0 = parseAnswer(text, isManual(it));
+        if (a0.kind !== "number") {
+          res.rows[id] = { ...res.rows[id], data: [res.rows[id].data, text].filter(Boolean).join(" \xB7 ") };
+          await save();
+          return reply(`\u{1F4CE} ${KIND_ML[kind]} KPI ${it.no}-\u0D7D \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41. \u0D07\u0D28\u0D3F ${isManual(it) ? "\u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02" : "\u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D"} \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`);
+        }
+      } else return reply(`\u{1F4CE} ${KIND_ML[kind]} KPI ${it.no}-\u0D7D \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41. \u0D07\u0D28\u0D3F ${isManual(it) ? "\u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 (\u0D09\u0D26\u0D3E: 92)" : "\u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D"} \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.`);
     }
     if (is(cmd, "skip")) {
       s.idx++;
@@ -874,35 +989,57 @@ ${done}/${items.length} KPI \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D
       return askCurrent();
     }
     const a = parseAnswer(text, isManual(it));
+    if (a.kind === "colour") return reply(isManual(it) ? "\u0D28\u0D3F\u0D31\u0D02 \u0D24\u0D28\u0D3F\u0D2F\u0D46 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D3E\u0D15\u0D4D\u0D15\u0D41\u0D02. \u0D0E\u0D24\u0D4D\u0D30 \u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F \u0D0E\u0D28\u0D4D\u0D28\u0D4D \u0D2E\u0D3E\u0D24\u0D4D\u0D30\u0D02 \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 92)." : "\u0D28\u0D3F\u0D31\u0D02 \u0D24\u0D28\u0D3F\u0D2F\u0D46 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D3E\u0D15\u0D4D\u0D15\u0D41\u0D02. \u0D08 \u0D06\u0D34\u0D4D\u0D1A\u0D2F\u0D3F\u0D32\u0D46 \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D \u0D2E\u0D3E\u0D24\u0D4D\u0D30\u0D02 \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 1420).");
+    if (a.kind !== "number") return reply(isManual(it) ? "\u0D2E\u0D28\u0D38\u0D4D\u0D38\u0D3F\u0D32\u0D3E\u0D2F\u0D3F\u0D32\u0D4D\u0D32. \u0D0E\u0D24\u0D4D\u0D30 \u0D36\u0D24\u0D2E\u0D3E\u0D28\u0D02 \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D3E\u0D2F\u0D3F \u0D0E\u0D28\u0D4D\u0D28\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 92). \u0D12\u0D34\u0D3F\u0D35\u0D3E\u0D15\u0D4D\u0D15\u0D3E\u0D7B SKIP." : "\u0D12\u0D30\u0D41 \u0D28\u0D2E\u0D4D\u0D2A\u0D7C \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 1420). \u0D12\u0D34\u0D3F\u0D35\u0D3E\u0D15\u0D4D\u0D15\u0D3E\u0D7B SKIP.");
     const base = { no: it.no, text: it.text, target: it.target, star: !!it.star, kraNo: it.kraNo, freq: it.freq };
     const old = res.rows[id] || {};
-    let row;
-    if (a.kind === "rag") row = { ...old, ...base, actual: old.actual || "", ach: old.ach ?? null, rag: a.rag };
-    else if (a.kind === "number") {
-      const ach = isManual(it) ? Math.min(Math.round(parseFloat(a.value)), 120) : calcAch(it, a.value);
-      row = { ...old, ...base, actual: isManual(it) ? old.actual || "" : a.value, ach, rag: "" };
-    } else {
-      return reply(isManual(it) ? "\u0D2E\u0D28\u0D38\u0D4D\u0D38\u0D3F\u0D32\u0D3E\u0D2F\u0D3F\u0D32\u0D4D\u0D32. % (\u0D09\u0D26\u0D3E: 92) \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D G / A / R \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15. \u0D12\u0D34\u0D3F\u0D35\u0D3E\u0D15\u0D4D\u0D15\u0D3E\u0D7B SKIP." : "\u0D12\u0D30\u0D41 \u0D28\u0D2E\u0D4D\u0D2A\u0D7C \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15 (\u0D09\u0D26\u0D3E: 1420). \u0D12\u0D34\u0D3F\u0D35\u0D3E\u0D15\u0D4D\u0D15\u0D3E\u0D7B SKIP.");
-    }
-    const rag = row.rag || ragOf(row.ach);
+    const ach = isManual(it) ? Math.max(0, Math.min(Math.round(parseFloat(a.value)), 120)) : calcAch(it, a.value);
+    const row = { ...old, ...base, actual: isManual(it) ? "" : a.value, ach };
+    delete row.rag;
+    const rag = statusOf(row);
+    const bad = rag === "A" || rag === "R";
     if (a.note) {
-      if (rag === "A" || rag === "R") row.reason = a.note;
+      if (bad) row.reason = a.note;
       else row.data = a.note;
     }
     res.rows[id] = row;
     await save();
-    const got = `\u2713 KPI ${it.no}: ${row.actual ? row.actual + " \u2192 " : ""}${row.ach != null ? row.ach + "% " : ""}${RAG_ML[rag] || ""}`;
-    if ((rag === "A" || rag === "R") && !row.reason) {
+    const got = `\u2713 KPI ${it.no}: ${row.actual ? row.actual + " \u2192 " : ""}${row.ach != null ? row.ach + "% " : ""}${RAG_ML[rag] || ""} \u{1F512}`;
+    if (bad && !(row.reason || "").trim() && !filesOf(row).length) {
       s.sub = "reason";
       await saveSession();
       return reply(`${got}
-\u0D15\u0D3E\u0D30\u0D23\u0D35\u0D41\u0D02 \u0D2A\u0D30\u0D3F\u0D39\u0D3E\u0D30 \u0D28\u0D1F\u0D2A\u0D1F\u0D3F\u0D2F\u0D41\u0D02 (\u0D0E\u0D28\u0D4D\u0D24\u0D4D, \u0D06\u0D30\u0D4D, \u0D0E\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E) \u0D0E\u0D34\u0D41\u0D24\u0D41\u0D15.`);
+
+${ASK_REASON(it.no, rag)}`);
+    }
+    if (bad && !(row.next || "").trim()) {
+      s.sub = "next";
+      await saveSession();
+      return reply(`${got}
+
+${ASK_NEXT(it.no)}`);
     }
     s.idx++;
     await saveSession();
     await reply(got);
     return askCurrent();
   }
+  if (media && s.step === "clarify") {
+    const fl = res.ai?.flags || [];
+    const f = fl[s.idx];
+    if (!f) return finish();
+    const target = dept.items.find((i) => String(i.no) === String(f.kpiNo));
+    const kind = await attachOrSay(target ? target.id : null, f);
+    if (!kind) return;
+    f.answer = text || `(${KIND_ML[kind]} \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41${target ? " \xB7 KPI " + target.no : ""})`;
+    await save();
+    s.idx++;
+    await saveSession();
+    await reply(`\u{1F4CE} ${KIND_ML[kind]} \u0D1A\u0D47\u0D7C\u0D24\u0D4D\u0D24\u0D41.`);
+    if (s.idx >= fl.length) return finish();
+    return askCurrent();
+  }
+  if (media) return reply("\u0D2B\u0D2F\u0D32\u0D41\u0D15\u0D7E KPI \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D19\u0D4D\u0D19\u0D7E\u0D15\u0D4D\u0D15\u0D41\u0D02 Claude-\u0D28\u0D4D\u0D31\u0D46 \u0D1A\u0D4B\u0D26\u0D4D\u0D2F\u0D19\u0D4D\u0D19\u0D7E\u0D15\u0D4D\u0D15\u0D41\u0D02 \u0D07\u0D1F\u0D2F\u0D3F\u0D7D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15. \u0D07\u0D35\u0D3F\u0D1F\u0D46 \u0D1F\u0D48\u0D2A\u0D4D\u0D2A\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D24\u0D4D \u0D2E\u0D31\u0D41\u0D2A\u0D1F\u0D3F \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.");
   if (s.step === "priorities") {
     res.priorities = is(cmd, "skip") || is(cmd, "none") ? ["", "", ""] : text.split(/\n|;/).map((x) => x.replace(/^\s*[\d.)\-•*]+\s*/, "").trim()).filter(Boolean).slice(0, 3);
     while (res.priorities.length < 3) res.priorities.push("");
@@ -940,8 +1077,10 @@ ${done}/${items.length} KPI \u0D2A\u0D42\u0D7C\u0D24\u0D4D\u0D24\u0D3F\u0D2F\u0D
 // supabase/functions/whatsapp/index.ts
 async function handleOne(db, m) {
   const from = String(m.from || "");
-  const text = m.text?.body ?? m.button?.text ?? m.interactive?.button_reply?.title ?? m.interactive?.list_reply?.title ?? "";
-  const ins = await db.from("wa_log").insert({ msg_id: m.id, phone: from, direction: "in", body: text || `[${m.type}]` });
+  const mm = m.audio || m.voice || m.image || m.document || m.video;
+  const media = mm && mm.id ? { id: String(mm.id), mime: String(mm.mime_type || ""), filename: String(m.document?.filename || ""), voice: !!(m.audio?.voice || m.voice) } : null;
+  const text = m.text?.body ?? m.button?.text ?? m.interactive?.button_reply?.title ?? m.interactive?.list_reply?.title ?? m.image?.caption ?? m.document?.caption ?? m.video?.caption ?? "";
+  const ins = await db.from("wa_log").insert({ msg_id: m.id, phone: from, direction: "in", body: (media ? `[${m.type}] ` : "") + (text || (media ? "" : `[${m.type}]`)) });
   if (ins.error) {
     if (String(ins.error.message).includes("duplicate")) return;
     console.error(ins.error);
@@ -949,9 +1088,9 @@ async function handleOne(db, m) {
   const { data: profile } = await db.from("profiles").select("id, full_name, phone, role, dept_id").eq("phone", from).maybeSingle();
   if (!profile) return sendText(db, from, "\u0D08 \u0D28\u0D2E\u0D4D\u0D2A\u0D7C Atlas KPI Review-\u0D7D \u0D30\u0D1C\u0D3F\u0D38\u0D4D\u0D31\u0D4D\u0D31\u0D7C \u0D1A\u0D46\u0D2F\u0D4D\u0D24\u0D3F\u0D1F\u0D4D\u0D1F\u0D3F\u0D32\u0D4D\u0D32. Admin-\u0D28\u0D46 \u0D2C\u0D28\u0D4D\u0D27\u0D2A\u0D4D\u0D2A\u0D46\u0D1F\u0D41\u0D15.");
   if (profile.role === "pending") return sendText(db, from, "\u0D28\u0D3F\u0D19\u0D4D\u0D19\u0D33\u0D41\u0D1F\u0D46 \u0D05\u0D15\u0D4D\u0D15\u0D57\u0D23\u0D4D\u0D1F\u0D3F\u0D28\u0D4D Admin \u0D07\u0D24\u0D41\u0D35\u0D30\u0D46 \u0D05\u0D28\u0D41\u0D2E\u0D24\u0D3F \u0D28\u0D7D\u0D15\u0D3F\u0D2F\u0D3F\u0D1F\u0D4D\u0D1F\u0D3F\u0D32\u0D4D\u0D32.");
-  if (!text) return sendText(db, from, "\u0D07\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E \u0D1F\u0D46\u0D15\u0D4D\u0D38\u0D4D\u0D31\u0D4D\u0D31\u0D4D \u0D2E\u0D46\u0D38\u0D47\u0D1C\u0D41\u0D15\u0D7E \u0D2E\u0D3E\u0D24\u0D4D\u0D30\u0D2E\u0D47 \u0D38\u0D4D\u0D35\u0D40\u0D15\u0D30\u0D3F\u0D15\u0D4D\u0D15\u0D42. \u0D15\u0D23\u0D15\u0D4D\u0D15\u0D4D \u0D1F\u0D48\u0D2A\u0D4D\u0D2A\u0D4D \u0D1A\u0D46\u0D2F\u0D4D\u0D24\u0D4D \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.");
+  if (!text && !media) return sendText(db, from, "\u0D1F\u0D46\u0D15\u0D4D\u0D38\u0D4D\u0D31\u0D4D\u0D31\u0D4D, \u0D36\u0D2C\u0D4D\u0D26 \u0D38\u0D28\u0D4D\u0D26\u0D47\u0D36\u0D02, \u0D2B\u0D4B\u0D1F\u0D4D\u0D1F\u0D4B \u0D05\u0D32\u0D4D\u0D32\u0D46\u0D19\u0D4D\u0D15\u0D3F\u0D7D \u0D21\u0D4B\u0D15\u0D4D\u0D2F\u0D41\u0D2E\u0D46\u0D28\u0D4D\u0D31\u0D4D \u0D2E\u0D3E\u0D24\u0D4D\u0D30\u0D2E\u0D47 \u0D38\u0D4D\u0D35\u0D40\u0D15\u0D30\u0D3F\u0D15\u0D4D\u0D15\u0D42.");
   try {
-    await handleMessage(db, profile, text);
+    await handleMessage(db, profile, text, media);
   } catch (e) {
     console.error("bot error", e);
     await sendText(db, from, "\u0D15\u0D4D\u0D37\u0D2E\u0D3F\u0D15\u0D4D\u0D15\u0D23\u0D02, \u0D12\u0D30\u0D41 \u0D2A\u0D4D\u0D30\u0D36\u0D4D\u0D28\u0D02 \u0D35\u0D28\u0D4D\u0D28\u0D41. \u0D15\u0D41\u0D31\u0D1A\u0D4D\u0D1A\u0D4D \u0D15\u0D34\u0D3F\u0D1E\u0D4D\u0D1E\u0D4D START \u0D05\u0D2F\u0D15\u0D4D\u0D15\u0D41\u0D15.").catch(() => {

@@ -19,8 +19,10 @@ export async function checkSheet(b: CheckInput, maxFlags = 8): Promise<CheckResu
 How to judge each row:
 - Result-oriented: a measured outcome against the target (a number, %, or "X out of Y"), backed by verifiable supporting data (count, source report, list).
 - Activity only: says work was "done", "checked", "followed up", "ongoing", or claims 100% / Green without saying what was measured or how.
-- Every Amber or Red row needs a root cause and a corrective action (what, who, by when).
-- Flag inconsistencies: status not matching actual vs target, 100% or Green with no data, figures that cannot be right for the target, headline KPIs left blank.
+- Every Amber or Red row needs a root cause ("reason") and a "nextStep" (what, who, by when). A vague next step ("will improve", "will follow up") is not enough — ask for the concrete action.
+- Status is calculated automatically from the achievement %, so never question the colour itself; question the figure or the evidence behind it.
+- "attached" lists voice notes / photos / files the HOD attached as evidence. You cannot open them: count them as supporting evidence that exists, do not ask for proof that is already attached, but still ask what they show if the written reason is empty.
+- Flag inconsistencies: 100% or Green with no data or evidence, figures that cannot be right for the target, headline KPIs left blank.
 - Next week's priorities should each name an expected number.
 - If the HOD already answered a question well (see earlier answers), do not ask it again.
 Never invent figures.
@@ -66,7 +68,7 @@ export async function reviewWeek(b: ReviewInput) {
 
 For each department judge:
 - Are results measured outcomes against targets with real data, or activity reports ("done", "checked", "followed up")?
-- Are Amber/Red KPIs explained with a root cause and a corrective action with owner and date?
+- Are Amber/Red KPIs explained with a root cause ("reason") and a concrete "nextStep" with owner and date? ("attached" = voice notes/photos/files given as evidence; you cannot open them.)
 - Did the HOD answer Claude's clarification questions properly, or dodge them? (Answers may be in Malayalam.)
 - Trend vs last week's score, overdue actions, KPIs Red two weeks running.
 - A department with a missing sheet should be called out.

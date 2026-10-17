@@ -1,10 +1,20 @@
 // Builds the weekly HOD review deck. Used by the app ("Make PPT") and by the Saturday 5 PM job,
 // so both produce exactly the same format. Pass in the PptxGenJS class and the week's data.
-import { RAGN, RATINGS, ragOf, summarize, fmt, fmtShort, weekRange, deptListOf } from "./core.js";
+import { RAGN, RATINGS, ragOf, statusOf, filesSummary, summarize, fmt, fmtShort, weekRange, deptListOf } from "./core.js";
 
 const INK = "12343B", GOLD = "B8892B", MUT = "5A6B6F", LINE = "D3DBD8", TXT = "13262B", RED = "B23434";
 const RC = { G: ["DDF0E4", "25734A"], A: ["F8E9CC", "9A6412"], R: ["F7DEDC", "B23434"], NA: ["E4E9E8", "6B7779"], none: ["E4E9E8", "6B7779"], "": ["FFFFFF", "5A6B6F"] };
 const FONT = "Calibri";
+/** Reason, next step, data and attached evidence for one KPI row, in one cell. */
+function whyCell(x) {
+  const parts = [];
+  if (x.reason) parts.push(x.reason);
+  if (x.next) parts.push("Next: " + x.next);
+  if (x.data) parts.push(x.data);
+  const f = filesSummary(x);
+  if (f) parts.push("📎 " + f);
+  return parts.join(" · ");
+}
 
 /**
  * @param PptxGenJS the PptxGenJS class
@@ -78,15 +88,15 @@ export function buildDeck(PptxGenJS, d) {
       s.addText("Results not submitted for this week.", { x: 0.5, y: 2.5, w: 12.3, h: 1, fontSize: 24, color: RED, bold: true, align: "center", fontFace: FONT });
       return;
     }
-    const rows = Object.entries(r.rows || {}).map(([id, x]) => ({ id, ...x, rag: x.rag || ragOf(x.ach) }))
+    const rows = Object.entries(r.rows || {}).map(([id, x]) => ({ id, ...x, rag: statusOf(x) }))
       .sort((a, b) => order[a.rag] - order[b.rag] || (b.star ? 1 : 0) - (a.star ? 1 : 0) || String(a.no).localeCompare(String(b.no), undefined, { numeric: true }));
     const per = 9; const pages = Math.max(1, Math.ceil(rows.length / per));
     for (let p = 0; p < pages; p++) {
       const s = pptx.addSlide({ masterName: "M" });
       head(s, `${dp.name} — ${sm.score != null ? sm.score + "%" : "—"} ${sm.rag !== "none" ? "· " + RAGN[sm.rag] : ""}`,
         `HOD ${dp.hod || ""} · ${sm.counts.G} Green, ${sm.counts.A} Amber, ${sm.counts.R} Red${r.status !== "submitted" ? " · DRAFT, not submitted" : ""}${r.source === "whatsapp" ? " · via WhatsApp" : ""}${pages > 1 ? ` · page ${p + 1} of ${pages}` : ""}`);
-      const tr = [[H(""), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Status"), H("Reason / data")]];
-      rows.slice(p * per, p * per + per).forEach((x) => tr.push([x.star ? { text: "★", options: { color: GOLD, align: "center" } } : "", x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "—", ragCell(x.rag), [x.reason, x.data].filter(Boolean).join(" · ")]));
+      const tr = [[H(""), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Status"), H("Reason · next step · evidence")]];
+      rows.slice(p * per, p * per + per).forEach((x) => tr.push([x.star ? { text: "★", options: { color: GOLD, align: "center" } } : "", x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "—", ragCell(x.rag), whyCell(x)]));
       if (tr.length === 1) tr.push(["", "", "No KPI rows entered", "", "", "", "", ""]);
       s.addTable(tr, tblOpts([0.35, 0.6, 4.1, 1.35, 1.0, 0.8, 0.95, 3.18]));
     }
@@ -112,11 +122,11 @@ export function buildDeck(PptxGenJS, d) {
 
   // Red KPIs across the group
   const reds = [];
-  ds.forEach((dp) => { const r = results[dp.id]; if (!r) return; Object.values(r.rows || {}).forEach((x) => { if ((x.rag || ragOf(x.ach)) === "R") reds.push([dp.name, x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "—", x.reason || ""]); }); });
+  ds.forEach((dp) => { const r = results[dp.id]; if (!r) return; Object.values(r.rows || {}).forEach((x) => { if ((statusOf(x)) === "R") reds.push([dp.name, x.no, x.text, x.target, String(x.actual || ""), x.ach != null ? x.ach + "%" : "—", whyCell(x)]); }); });
   for (let p = 0; p < Math.max(1, Math.ceil(reds.length / 10)); p++) {
     const s = pptx.addSlide({ masterName: "M" });
     head(s, "Red KPIs across the group", reds.length ? `${reds.length} KPIs below 80% of target — each needs an owner, action and date` : "No Red KPIs reported this week");
-    if (reds.length) s.addTable([[H("Department"), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Reason")], ...reds.slice(p * 10, p * 10 + 10)], tblOpts([1.8, 0.6, 4.0, 1.4, 1.0, 0.8, 2.73]));
+    if (reds.length) s.addTable([[H("Department"), H("#"), H("KPI"), H("Target"), H("Actual"), H("Ach %"), H("Reason · next step")], ...reds.slice(p * 10, p * 10 + 10)], tblOpts([1.8, 0.6, 4.0, 1.4, 1.0, 0.8, 2.73]));
   }
 
   // Pending points

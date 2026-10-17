@@ -196,9 +196,23 @@ td .inp{min-width:0}
   table.sheet tr{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px 12px;border:1px solid var(--line);border-radius:var(--radius);padding:12px;margin-bottom:10px;background:var(--surface)}
   table.sheet td{display:block;border:0;padding:0;min-width:0!important}
   table.sheet td.kpi{grid-column:1/-1;font-weight:600}
-  table.sheet td:nth-child(5), table.sheet td:nth-child(6){grid-column:span 3}
+  table.sheet td:nth-child(5), table.sheet td:nth-child(6), table.sheet td:nth-child(7){grid-column:span 3}
   table.sheet td[data-label]:not([data-label=""])::before{content:attr(data-label);display:block;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:2px}
   table.sheet .inp{width:100%}
 }
 .savebar .grow:empty{display:none}
 @media (max-width:560px){ .savebar{flex-wrap:nowrap} .savebar .btn{flex:1 1 0} }
+
+/* v2.2: locked status, proof attachments */
+.pill.locked{cursor:help}
+.files{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;align-items:center}
+.files:empty{display:none}
+.ftools{display:inline-flex;gap:4px;flex-wrap:wrap}
+.ftools .btn.small{padding:2px 8px;font-size:12px;font-weight:600}
+.btn.rec{background:var(--r-bg);color:var(--r);border-color:var(--r)}
+.fchip{display:inline-flex;align-items:center;gap:2px;background:var(--sunk);border-radius:999px;padding:1px 4px 1px 8px;font-size:12px;max-width:100%}
+.fchip .link{border:0;background:none;color:var(--ink);font-weight:600;cursor:pointer;padding:2px 0;font:inherit;font-weight:600;text-decoration:underline;text-underline-offset:2px}
+.fchip .x{border:0;background:none;color:var(--muted);cursor:pointer;padding:2px 6px;font-size:12px}
+.fchip .x:hover{color:var(--r)}
+@media (pointer:coarse){.ftools .btn.small{min-height:36px;padding:4px 10px}.fchip .x{min-width:32px;min-height:32px}}
+table.sheet textarea.inp{field-sizing:content;min-height:38px;max-height:160px}

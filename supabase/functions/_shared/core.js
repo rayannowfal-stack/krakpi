@@ -40,21 +40,36 @@ export function calcAch(item, actual) {
 }
 export const ragOf = (ach) => (ach == null ? "" : ach >= 95 ? "G" : ach >= 80 ? "A" : "R");
 export const isManual = (item) => item.tv == null && item.dir !== "zero";
+/** A KPI's status is LOCKED to its achievement %: nobody picks Green/Amber/Red by hand. */
+export const statusOf = (r) => ragOf(r && typeof r.ach === "number" ? r.ach : null);
+/** Attachments (voice notes, photos, files) on one KPI row. */
+export const filesOf = (r) => (r && Array.isArray(r.files) ? r.files : []);
+export const KIND_ML = { voice: "ശബ്ദ സന്ദേശം", photo: "ഫോട്ടോ", file: "ഫയൽ" };
+export const kindOf = (mime) => (/^audio\//.test(mime || "") ? "voice" : /^image\//.test(mime || "") ? "photo" : "file");
+/** "1 voice note, 2 photos" — what's attached, for Claude and the PPT. */
+export function filesSummary(r) {
+  const c = { voice: 0, photo: 0, file: 0 };
+  filesOf(r).forEach((f) => { c[f.kind || kindOf(f.type)]++; });
+  const out = [];
+  if (c.voice) out.push(`${c.voice} voice note${c.voice > 1 ? "s" : ""}`);
+  if (c.photo) out.push(`${c.photo} photo${c.photo > 1 ? "s" : ""}`);
+  if (c.file) out.push(`${c.file} file${c.file > 1 ? "s" : ""}`);
+  return out.join(", ");
+}
 export function summarize(rows) {
   const c = { G: 0, A: 0, R: 0 }; let sum = 0, n = 0;
   for (const r of Object.values(rows || {})) {
-    const rag = r.rag || ragOf(r.ach);
+    const rag = statusOf(r);
     if (c[rag] != null) c[rag]++;
     if (typeof r.ach === "number") { sum += Math.min(r.ach, 120); n++; }
-    else if (rag === "G") { sum += 100; n++; } else if (rag === "A") { sum += 87; n++; } else if (rag === "R") { sum += 60; n++; }
   }
   const score = n ? Math.round(sum / n) : null;
   return { score, counts: c, rag: score == null ? "none" : ragOf(score) };
 }
-export const hasValue = (r) => !!r && !!(r.actual || r.rag || r.reason || r.data || r.ach != null);
+export const hasValue = (r) => !!r && !!(r.actual || r.reason || r.data || r.next || r.ach != null || filesOf(r).length);
 /** Fingerprint of the figures, so a Claude check is redone when figures change. */
 export function rowsHash(rows) {
-  return Object.keys(rows || {}).sort().map((k) => { const r = rows[k]; return [k, r.actual ?? "", r.ach ?? "", r.rag || "", r.reason || "", r.data || ""].join("|"); }).join("~");
+  return Object.keys(rows || {}).sort().map((k) => { const r = rows[k]; return [k, r.actual ?? "", r.ach ?? "", r.reason || "", r.data || "", r.next || "", filesOf(r).map((f) => f.path).join(",")].join("|"); }).join("~");
 }
 
 /* ---------- KPI lists ---------- */
@@ -89,7 +104,7 @@ export function repeatReds(depts, results, prev) {
     const r = results[d.id], p = prev[d.id]; if (!r || !p) return;
     for (const [id, x] of Object.entries(r.rows || {})) {
       const y = (p.rows || {})[id];
-      if (y && (x.rag || ragOf(x.ach)) === "R" && (y.rag || ragOf(y.ach)) === "R") out.push({ dept: d.id, name: d.name, no: x.no, text: x.text });
+      if (y && (statusOf(x)) === "R" && (statusOf(y)) === "R") out.push({ dept: d.id, name: d.name, no: x.no, text: x.text });
     }
   });
   return out;
@@ -117,7 +132,7 @@ export function checkRows(dept, rows) {
   const out = [];
   for (const i of (dept && dept.items) || []) {
     const r = rows[i.id]; if (!hasValue(r)) continue;
-    out.push({ no: i.no, kpi: i.text, target: i.target, freq: FREQ[i.freq] || i.freq, headline: !!i.star, actual: r.actual || "", achievement: r.ach != null ? r.ach + "%" : "", status: RAGN[r.rag || ragOf(r.ach)] || "", reason: r.reason || "", data: r.data || "" });
+    out.push({ no: i.no, kpi: i.text, target: i.target, freq: FREQ[i.freq] || i.freq, headline: !!i.star, actual: r.actual || "", achievement: r.ach != null ? r.ach + "%" : "", status: RAGN[statusOf(r)] || "", reason: r.reason || "", data: r.data || "", nextStep: r.next || "", attached: filesSummary(r) });
   }
   return out;
 }
@@ -132,7 +147,7 @@ export function reviewDepartments({ depts, results, prev, actions, today }) {
     return {
       id: d.id, name: d.name, hod: d.hod, sheet: r ? r.status : "missing", via: r ? r.source : "", score: r ? summarize(r.rows).score : null, lastWeekScore: p ? summarize(p.rows).score : null,
       claudeCheck: r && r.ai ? { rating: r.ai.rating, evidenceScore: r.ai.score, summary: r.ai.summary } : null,
-      rows: r ? Object.values(r.rows || {}).map((x) => ({ no: x.no, kpi: x.text, target: x.target, actual: x.actual, ach: x.ach, status: RAGN[x.rag || ragOf(x.ach)] || "", reason: x.reason, data: x.data })) : [],
+      rows: r ? Object.values(r.rows || {}).map((x) => ({ no: x.no, kpi: x.text, target: x.target, actual: x.actual, ach: x.ach, status: RAGN[statusOf(x)] || "", reason: x.reason, data: x.data, nextStep: x.next || "", attached: filesSummary(x) })) : [],
       clarifications: r ? [...(r.clar || []), ...((r.ai && r.ai.flags) || [])].map((c) => ({ kpi: c.kpiNo, q: c.question, a: c.answer || "NOT ANSWERED" })) : [],
       priorities: r ? (r.priorities || []).filter(Boolean) : [], support: r ? r.support : "",
       openActions: actions.filter((a) => a.dept === d.id && a.status !== "Done").map((a) => ({ action: a.action, owner: a.owner, due: a.due, overdue: !!(a.due && a.due < today), status: a.status })),

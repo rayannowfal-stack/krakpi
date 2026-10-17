@@ -2,10 +2,10 @@
 // then asks Claude's clarification questions (in Malayalam) and records those answers too.
 import {
   addDays, buildDepts, calcAch, FREQ_ML, fmt, hasValue, isManual, istToday, itemsFor, mapResult, meetingWeek,
-  RAG_ML, ragOf, RATING_ML, rowsHash, summarize, weekRange, checkRows, missingHeadline,
+  RAG_ML, ragOf, statusOf, filesOf, kindOf, KIND_ML, RATING_ML, rowsHash, summarize, weekRange, checkRows, missingHeadline,
 } from "./core.js";
 import { checkSheet } from "./ai.ts";
-import { sendText } from "./wa.ts";
+import { sendText, downloadMedia } from "./wa.ts";
 import { getSettings, ppt } from "./jobs.ts";
 // deno-lint-ignore-file no-explicit-any
 type Db = any;
@@ -21,7 +21,9 @@ const WORDS = {
   none: ["no", "nil", "none", "ഇല്ല", "വേണ്ട", "na", "n/a"],
 };
 const is = (t: string, k: keyof typeof WORDS) => WORDS[k].includes(t);
-const RAG_WORDS: Record<string, string> = { g: "G", green: "G", "പച്ച": "G", a: "A", amber: "A", "മഞ്ഞ": "A", r: "R", red: "R", "ചുവപ്പ്": "R" };
+// Status is locked to the achievement %: colour words are not accepted as an answer.
+const RAG_WORDS = new Set(["g", "green", "പച്ച", "a", "amber", "മഞ്ഞ", "r", "red", "ചുവപ്പ്"]);
+export type Media = { id: string; mime: string; filename?: string; voice?: boolean };
 
 const HELP = "*സഹായം*\nSTART – റിപ്പോർട്ട് തുടങ്ങാൻ / തുടരാൻ\nSKIP – ഈ ചോദ്യം ഒഴിവാക്കാൻ\nBACK – മുമ്പത്തെ ചോദ്യം\nSTATUS – എത്ര പൂർത്തിയായി\nSTOP – പിന്നീട് തുടരാൻ\nRESTART – ആദ്യം മുതൽ മാറ്റാൻ";
 
@@ -29,9 +31,7 @@ const HELP = "*സഹായം*\nSTART – റിപ്പോർട്ട് ത
 export function parseAnswer(text: string, manual: boolean) {
   const t = text.trim();
   const first = t.split(/[\s,.:;\-]+/)[0].toLowerCase();
-  if (manual && RAG_WORDS[first]) {
-    return { kind: "rag", rag: RAG_WORDS[first], note: t.slice(t.split(/[\s,.:;\-]+/)[0].length).replace(/^[\s,.:;\-]+/, "").trim() };
-  }
+  if (RAG_WORDS.has(first)) return { kind: "colour" as const };
   const m = t.replace(/rs\.?\s*/ig, "").match(/-?\d[\d,]*(\.\d+)?/);
   if (!m) return { kind: "none" as const };
   const value = m[0].replace(/,/g, "");
@@ -41,19 +41,22 @@ export function parseAnswer(text: string, manual: boolean) {
 
 function askKpi(item: any, i: number, n: number, row: any) {
   let s = `*${i + 1}/${n} · KPI ${item.no}${item.star ? " ★" : ""}*\n${item.text}\nലക്ഷ്യം: ${item.target} (${FREQ_ML[item.freq] || item.freq})`;
-  if (hasValue(row)) s += `\nഇപ്പോൾ: ${row.actual || (row.ach != null ? row.ach + "%" : RAG_ML[row.rag] || "")} — മാറ്റമില്ലെങ്കിൽ SKIP`;
+  if (hasValue(row)) s += `\nഇപ്പോൾ: ${row.actual || (row.ach != null ? row.ach + "%" : "")}${filesOf(row).length ? " · 📎 " + filesOf(row).length : ""} — മാറ്റമില്ലെങ്കിൽ SKIP`;
   s += isManual(item)
-    ? "\n\nഈ ആഴ്ചയിലെ ഫലം അയക്കുക: % (ഉദാ: 92) അല്ലെങ്കിൽ G / A / R. കൂടെ ഡാറ്റ എഴുതാം."
+    ? "\n\nഎത്ര ശതമാനം പൂർത്തിയായി എന്ന് അയക്കുക (ഉദാ: 92). കൂടെ ഡാറ്റ എഴുതാം. നിറം (Green/Amber/Red) തനിയെ വരും."
     : "\n\nഈ ആഴ്ചയിലെ യഥാർത്ഥ കണക്ക് അയക്കുക. കൂടെ ഡാറ്റ എഴുതാം (ഉദാ: 1420, billing report).";
+  s += "\nതെളിവായി ഫോട്ടോ / ശബ്ദ സന്ദേശം / ഡോക്യുമെന്റ് അയക്കാം.";
   return s;
 }
 const askFlag = (f: any, i: number, n: number) =>
   `*Claude-ന്റെ ചോദ്യം ${i + 1}/${n}*${f.kpiNo ? " · KPI " + f.kpiNo : ""}${f.severity === "high" ? " (മറുപടി നിർബന്ധം)" : ""}\n${f.question}`;
+const ASK_REASON = (no: string, rag: string) => `KPI ${no}: ${RAG_ML[rag] || ""}\n*കാരണം* എന്താണ്? ടൈപ്പ് ചെയ്യുക, അല്ലെങ്കിൽ ശബ്ദ സന്ദേശം / ഫോട്ടോ / ഡോക്യുമെന്റ് അയക്കുക.`;
+const ASK_NEXT = (no: string) => `KPI ${no}: *അടുത്ത നടപടി* എന്താണ്? (എന്ത്, ആര്, എപ്പോൾ)\nഉദാ: Perumbavoor-ൽ 2 staff കൂടി, Manager Rajesh, 25 Oct-നകം`;
 const ASK_PRI = "*അടുത്ത ആഴ്ചയിലെ 3 പ്രധാന മുൻഗണനകൾ*\nഓരോന്നും പ്രതീക്ഷിക്കുന്ന നമ്പറോടെ, ഓരോ വരിയിൽ ഒന്ന്.\nഉദാ: Perumbavoor conversion 75% ആക്കുക";
 const ASK_SUP = "*സഹായം വേണോ?*\nCEO-യിൽ നിന്നോ മറ്റ് വകുപ്പുകളിൽ നിന്നോ എന്ത് സഹായം വേണം? ഇല്ലെങ്കിൽ ‘ഇല്ല’ എന്ന് അയക്കുക.";
 
 /** Handles one incoming WhatsApp text from a registered person. */
-export async function handleMessage(db: Db, profile: any, textIn: string) {
+export async function handleMessage(db: Db, profile: any, textIn: string, media: Media | null = null) {
   const text = (textIn || "").trim();
   const cmd = text.toLowerCase();
   const reply = (s: string) => sendText(db, profile.phone, s);
@@ -107,6 +110,39 @@ export async function handleMessage(db: Db, profile: any, textIn: string) {
     s.updated_at = new Date().toISOString();
     await db.from("wa_sessions").upsert({ phone: profile.phone, user_id: profile.id, dept_id: profile.dept_id, week, step: s.step, idx: s.idx, items: s.items, sub: s.sub ?? null, updated_at: s.updated_at });
   };
+  /** Saves a voice note / photo / document from WhatsApp as proof on one KPI. */
+  const storeMedia = async (folder: string) => {
+    const m = media!;
+    const { bytes, mime } = await downloadMedia(m.id);
+    if (bytes.length > 16 * 1024 * 1024) throw new Error("file too big");
+    const type = mime || m.mime || "application/octet-stream";
+    const kind = m.voice ? "voice" : kindOf(type);
+    const ext = (type.split("/")[1] || "bin").replace(/[^a-z0-9]/gi, "").slice(0, 5) || "bin";
+    const name = (m.filename || `${kind}-whatsapp.${ext}`).replace(/[^\w.\-]+/g, "_").slice(-60);
+    const path = `${week}/${profile.dept_id}/${folder}/${Date.now()}-${name}`;
+    const up = await db.storage.from("evidence").upload(path, bytes, { contentType: type, upsert: false });
+    if (up.error) throw new Error(up.error.message);
+    return { path, name, type, size: bytes.length, kind, at: new Date().toISOString(), via: "whatsapp" };
+  };
+  const attach = async (kpiId: string) => {
+    const meta = await storeMedia(kpiId);
+    const it = byId[kpiId];
+    const base = it ? { no: it.no, text: it.text, target: it.target, star: !!it.star, kraNo: it.kraNo, freq: it.freq } : {};
+    const old = res.rows[kpiId] || { actual: "", ach: null };
+    res.rows[kpiId] = { ...old, ...base, files: [...filesOf(old), meta] };
+    await save();
+    return meta.kind as "voice" | "photo" | "file";
+  };
+  const attachOrSay = async (kpiId: string | null, flag?: any) => {
+    try {
+      if (kpiId) return await attach(kpiId);
+      const meta = await storeMedia("_general");
+      if (flag) flag.files = [...(flag.files || []), meta];
+      return meta.kind as "voice" | "photo" | "file";
+    }
+    catch (e) { console.error("attach failed", e); await reply("ഫയൽ സേവ് ചെയ്യാനായില്ല. വീണ്ടും അയക്കുക, അല്ലെങ്കിൽ ടൈപ്പ് ചെയ്യുക."); return null; }
+  };
+
   const start = async (fromBeginning: boolean) => {
     const st = await getSettings(db);
     let items = itemsFor(dept, false);
@@ -124,7 +160,8 @@ export async function handleMessage(db: Db, profile: any, textIn: string) {
       if (s.idx >= s.items.length) { s.step = "priorities"; s.idx = 0; await saveSession(); return reply(ASK_PRI); }
       const it = byId[s.items[s.idx]];
       if (!it) { s.idx++; return askCurrent(); }
-      if (s.sub === "reason") return reply(`KPI ${it.no}: ${RAG_ML[res.rows[it.id]?.rag || ragOf(res.rows[it.id]?.ach)] || ""}\nകാരണവും പരിഹാര നടപടിയും (എന്ത്, ആര്, എപ്പോൾ) എഴുതുക.`);
+      if (s.sub === "reason") return reply(ASK_REASON(it.no, statusOf(res.rows[it.id])));
+      if (s.sub === "next") return reply(ASK_NEXT(it.no));
       return reply(askKpi(it, s.idx, s.items.length, res.rows[it.id]));
     }
     if (s.step === "priorities") return reply(ASK_PRI);
@@ -186,35 +223,74 @@ export async function handleMessage(db: Db, profile: any, textIn: string) {
     if (!it) { s.idx++; await saveSession(); return askCurrent(); }
     if (is(cmd, "back")) { s.sub = null; s.idx = Math.max(0, s.idx - 1); await saveSession(); return askCurrent(); }
     if (s.sub === "reason") {
-      if (is(cmd, "skip")) { s.sub = null; s.idx++; await saveSession(); return askCurrent(); }
+      if (media) {
+        const kind = await attachOrSay(id); if (!kind) return;
+        if (text) res.rows[id] = { ...res.rows[id], reason: text };
+        else if (!(res.rows[id].reason || "").trim()) res.rows[id] = { ...res.rows[id], reason: `(${KIND_ML[kind]} ചേർത്തു)` };
+        await save();
+        s.sub = "next"; await saveSession();
+        return reply(`📎 ${KIND_ML[kind]} KPI ${it.no}-ൽ ചേർത്തു.\n\n${ASK_NEXT(it.no)}`);
+      }
+      if (is(cmd, "skip")) { s.sub = "next"; await saveSession(); return askCurrent(); }
       res.rows[id] = { ...res.rows[id], reason: text }; await save();
-      s.sub = null; s.idx++; await saveSession();
+      s.sub = "next"; await saveSession();
       return askCurrent();
+    }
+    if (s.sub === "next") {
+      if (media) {
+        const kind = await attachOrSay(id); if (!kind) return;
+        res.rows[id] = { ...res.rows[id], next: text || `(${KIND_ML[kind]} ചേർത്തു)` }; await save();
+      } else if (!is(cmd, "skip")) { res.rows[id] = { ...res.rows[id], next: text }; await save(); }
+      s.sub = null; s.idx++; await saveSession();
+      await reply(`✓ KPI ${it.no} പൂർത്തിയായി.`);
+      return askCurrent();
+    }
+    if (media) {
+      // proof sent while the KPI's figure is being asked: keep it on this KPI, then still ask the figure
+      const kind = await attachOrSay(id); if (!kind) return;
+      if (text) {
+        const a0 = parseAnswer(text, isManual(it));
+        if (a0.kind !== "number") { res.rows[id] = { ...res.rows[id], data: [res.rows[id].data, text].filter(Boolean).join(" · ") }; await save(); return reply(`📎 ${KIND_ML[kind]} KPI ${it.no}-ൽ ചേർത്തു. ഇനി ${isManual(it) ? "ശതമാനം" : "കണക്ക്"} അയക്കുക.`); }
+      } else return reply(`📎 ${KIND_ML[kind]} KPI ${it.no}-ൽ ചേർത്തു. ഇനി ${isManual(it) ? "ശതമാനം (ഉദാ: 92)" : "ഈ ആഴ്ചയിലെ കണക്ക്"} അയക്കുക.`);
     }
     if (is(cmd, "skip")) { s.idx++; await saveSession(); return askCurrent(); }
     const a = parseAnswer(text, isManual(it));
+    if (a.kind === "colour") return reply(isManual(it) ? "നിറം തനിയെ കണക്കാക്കും. എത്ര ശതമാനം പൂർത്തിയായി എന്ന് മാത്രം അയക്കുക (ഉദാ: 92)." : "നിറം തനിയെ കണക്കാക്കും. ഈ ആഴ്ചയിലെ കണക്ക് മാത്രം അയക്കുക (ഉദാ: 1420).");
+    if (a.kind !== "number") return reply(isManual(it) ? "മനസ്സിലായില്ല. എത്ര ശതമാനം പൂർത്തിയായി എന്ന് അയക്കുക (ഉദാ: 92). ഒഴിവാക്കാൻ SKIP." : "ഒരു നമ്പർ അയക്കുക (ഉദാ: 1420). ഒഴിവാക്കാൻ SKIP.");
     const base = { no: it.no, text: it.text, target: it.target, star: !!it.star, kraNo: it.kraNo, freq: it.freq };
     const old = res.rows[id] || {};
-    let row: any;
-    if (a.kind === "rag") row = { ...old, ...base, actual: old.actual || "", ach: old.ach ?? null, rag: a.rag };
-    else if (a.kind === "number") {
-      const ach = isManual(it) ? Math.min(Math.round(parseFloat(a.value)), 120) : calcAch(it, a.value);
-      row = { ...old, ...base, actual: isManual(it) ? old.actual || "" : a.value, ach, rag: "" };
-    } else {
-      return reply(isManual(it) ? "മനസ്സിലായില്ല. % (ഉദാ: 92) അല്ലെങ്കിൽ G / A / R അയക്കുക. ഒഴിവാക്കാൻ SKIP." : "ഒരു നമ്പർ അയക്കുക (ഉദാ: 1420). ഒഴിവാക്കാൻ SKIP.");
-    }
-    const rag = row.rag || ragOf(row.ach);
-    if (a.note) { if (rag === "A" || rag === "R") row.reason = a.note; else row.data = a.note; }
+    const ach = isManual(it) ? Math.max(0, Math.min(Math.round(parseFloat(a.value)), 120)) : calcAch(it, a.value);
+    const row: any = { ...old, ...base, actual: isManual(it) ? "" : a.value, ach };
+    delete row.rag;
+    const rag = statusOf(row);
+    const bad = rag === "A" || rag === "R";
+    if (a.note) { if (bad) row.reason = a.note; else row.data = a.note; }
     res.rows[id] = row; await save();
-    const got = `✓ KPI ${it.no}: ${row.actual ? row.actual + " → " : ""}${row.ach != null ? row.ach + "% " : ""}${RAG_ML[rag] || ""}`;
-    if ((rag === "A" || rag === "R") && !row.reason) {
+    const got = `✓ KPI ${it.no}: ${row.actual ? row.actual + " → " : ""}${row.ach != null ? row.ach + "% " : ""}${RAG_ML[rag] || ""} 🔒`;
+    if (bad && !(row.reason || "").trim() && !filesOf(row).length) {
       s.sub = "reason"; await saveSession();
-      return reply(`${got}\nകാരണവും പരിഹാര നടപടിയും (എന്ത്, ആര്, എപ്പോൾ) എഴുതുക.`);
+      return reply(`${got}\n\n${ASK_REASON(it.no, rag)}`);
+    }
+    if (bad && !(row.next || "").trim()) {
+      s.sub = "next"; await saveSession();
+      return reply(`${got}\n\n${ASK_NEXT(it.no)}`);
     }
     s.idx++; await saveSession();
     await reply(got);
     return askCurrent();
   }
+  if (media && s.step === "clarify") {
+    const fl = res.ai?.flags || []; const f = fl[s.idx];
+    if (!f) return finish();
+    const target = dept.items.find((i: any) => String(i.no) === String(f.kpiNo));
+    const kind = await attachOrSay(target ? target.id : null, f); if (!kind) return;
+    f.answer = text || `(${KIND_ML[kind]} ചേർത്തു${target ? " · KPI " + target.no : ""})`; await save();
+    s.idx++; await saveSession();
+    await reply(`📎 ${KIND_ML[kind]} ചേർത്തു.`);
+    if (s.idx >= fl.length) return finish();
+    return askCurrent();
+  }
+  if (media) return reply("ഫയലുകൾ KPI ചോദ്യങ്ങൾക്കും Claude-ന്റെ ചോദ്യങ്ങൾക്കും ഇടയിൽ അയക്കുക. ഇവിടെ ടൈപ്പ് ചെയ്ത് മറുപടി അയക്കുക.");
   if (s.step === "priorities") {
     res.priorities = is(cmd, "skip") || is(cmd, "none") ? ["", "", ""] : text.split(/\n|;/).map((x) => x.replace(/^\s*[\d.)\-•*]+\s*/, "").trim()).filter(Boolean).slice(0, 3);
     while (res.priorities.length < 3) res.priorities.push("");

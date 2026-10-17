@@ -34,13 +34,21 @@ export class HttpError extends Error {
   constructor(public status: number, message: string) { super(message); }
 }
 
+/** Claude API headers. ANTHROPIC_WORKSPACE_ID (optional secret) is only needed for an API key that isn't scoped to a workspace. */
+function claudeHeaders(key: string) {
+  const h: Record<string, string> = { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" };
+  const ws = Deno.env.get("ANTHROPIC_WORKSPACE_ID");
+  if (ws) h["anthropic-workspace-id"] = ws.trim();
+  return h;
+}
+
 /** Sends one prompt to Claude and returns the reply parsed as JSON. */
 export async function askClaudeJson(prompt: string, opts: { model: string; maxTokens: number }) {
   const key = Deno.env.get("ANTHROPIC_API_KEY");
   if (!key) throw new HttpError(500, "Claude is not set up: add the ANTHROPIC_API_KEY secret in Supabase.");
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    headers: claudeHeaders(key),
     body: JSON.stringify({
       model: opts.model,
       max_tokens: opts.maxTokens,
@@ -52,7 +60,11 @@ export async function askClaudeJson(prompt: string, opts: { model: string; maxTo
     console.error("Claude API error", res.status, detail);
     if (res.status === 429 || res.status === 529) throw new HttpError(503, "Claude is busy right now. Try again in a minute.");
     if (res.status === 401) throw new HttpError(500, "The Claude API key is not valid. Check the ANTHROPIC_API_KEY secret.");
-    throw new HttpError(502, "Claude could not answer. Try again.");
+    let why = "";
+    try { why = JSON.parse(detail)?.error?.message ?? ""; } catch (_) { /* not JSON */ }
+    if (/workspace/i.test(why)) throw new HttpError(500, "The Claude API key is not linked to a workspace. Make a new key inside a workspace (platform.claude.com → API Keys) and save it as ANTHROPIC_API_KEY.");
+    if (/credit balance/i.test(why)) throw new HttpError(500, "Claude API credit is used up. Add credit at platform.claude.com → Billing.");
+    throw new HttpError(502, "Claude could not answer" + (why ? ": " + why.slice(0, 200) : ". Try again."));
   }
   const data = await res.json();
   const text: string = (data.content ?? []).filter((b: { type: string }) => b.type === "text").map((b: { text: string }) => b.text).join("");

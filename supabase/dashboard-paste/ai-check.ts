@@ -28,12 +28,18 @@ var HttpError = class extends Error {
   }
   status;
 };
+function claudeHeaders(key) {
+  const h = { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" };
+  const ws = Deno.env.get("ANTHROPIC_WORKSPACE_ID");
+  if (ws) h["anthropic-workspace-id"] = ws.trim();
+  return h;
+}
 async function askClaudeJson(prompt, opts) {
   const key = Deno.env.get("ANTHROPIC_API_KEY");
   if (!key) throw new HttpError(500, "Claude is not set up: add the ANTHROPIC_API_KEY secret in Supabase.");
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    headers: claudeHeaders(key),
     body: JSON.stringify({
       model: opts.model,
       max_tokens: opts.maxTokens,
@@ -45,7 +51,14 @@ async function askClaudeJson(prompt, opts) {
     console.error("Claude API error", res.status, detail);
     if (res.status === 429 || res.status === 529) throw new HttpError(503, "Claude is busy right now. Try again in a minute.");
     if (res.status === 401) throw new HttpError(500, "The Claude API key is not valid. Check the ANTHROPIC_API_KEY secret.");
-    throw new HttpError(502, "Claude could not answer. Try again.");
+    let why = "";
+    try {
+      why = JSON.parse(detail)?.error?.message ?? "";
+    } catch (_) {
+    }
+    if (/workspace/i.test(why)) throw new HttpError(500, "The Claude API key is not linked to a workspace. Make a new key inside a workspace (platform.claude.com \u2192 API Keys) and save it as ANTHROPIC_API_KEY.");
+    if (/credit balance/i.test(why)) throw new HttpError(500, "Claude API credit is used up. Add credit at platform.claude.com \u2192 Billing.");
+    throw new HttpError(502, "Claude could not answer" + (why ? ": " + why.slice(0, 200) : ". Try again."));
   }
   const data = await res.json();
   const text = (data.content ?? []).filter((b) => b.type === "text").map((b) => b.text).join("");
@@ -76,8 +89,10 @@ async function checkSheet(b, maxFlags = 8) {
 How to judge each row:
 - Result-oriented: a measured outcome against the target (a number, %, or "X out of Y"), backed by verifiable supporting data (count, source report, list).
 - Activity only: says work was "done", "checked", "followed up", "ongoing", or claims 100% / Green without saying what was measured or how.
-- Every Amber or Red row needs a root cause and a corrective action (what, who, by when).
-- Flag inconsistencies: status not matching actual vs target, 100% or Green with no data, figures that cannot be right for the target, headline KPIs left blank.
+- Every Amber or Red row needs a root cause ("reason") and a "nextStep" (what, who, by when). A vague next step ("will improve", "will follow up") is not enough \u2014 ask for the concrete action.
+- Status is calculated automatically from the achievement %, so never question the colour itself; question the figure or the evidence behind it.
+- "attached" lists voice notes / photos / files the HOD attached as evidence. You cannot open them: count them as supporting evidence that exists, do not ask for proof that is already attached, but still ask what they show if the written reason is empty.
+- Flag inconsistencies: 100% or Green with no data or evidence, figures that cannot be right for the target, headline KPIs left blank.
 - Next week's priorities should each name an expected number.
 - If the HOD already answered a question well (see earlier answers), do not ask it again.
 Never invent figures.

@@ -5,7 +5,7 @@ import PptxGenJS from "pptxgenjs";
 import { supabase } from "./supabase.js";
 import {
   FREQ, WEEKLY, RAGN, RATINGS, RATING_ML, addDays, fmt, fmtShort, meetingWeek, weekRange, ymd,
-  calcAch, ragOf, isManual, summarize, rowsHash, itemsFor, buildDepts, deptListOf,
+  calcAch, ragOf, statusOf, filesOf, filesSummary, kindOf, hasValue, isManual, summarize, rowsHash, itemsFor, buildDepts, deptListOf,
   mapResult, mapAction, mapProposal, repeatReds, checkRows, missingHeadline, normPhone, normUsername, userLogin,
 } from "../supabase/functions/_shared/core.js";
 import { buildDeck } from "../supabase/functions/_shared/ppt-builder.js";
@@ -284,22 +284,21 @@ function ensureForm() {
 function vSubmit() {
   const ds = deptList(); const d = S.depts[S.dept]; const f = ensureForm(); const r = S.results[S.dept];
   const editable = mayEditDept(S.dept);
-  const all = S.showAll || Object.keys(f.rows).some((id) => !WEEKLY.has(((d.items || []).find((i) => i.id === id) || {}).freq) && (f.rows[id].actual || f.rows[id].rag));
+  const all = S.showAll || Object.keys(f.rows).some((id) => !WEEKLY.has(((d.items || []).find((i) => i.id === id) || {}).freq) && hasValue(f.rows[id]));
   const items = itemsFor(d, all);
   const dis = editable ? "" : "disabled";
   const rowsHtml = items.map((i) => {
     const row = f.rows[i.id] || {};
-    const ach = row.ach != null ? row.ach : null; const rag = row.rag || ragOf(ach);
+    const ach = typeof row.ach === "number" ? row.ach : null; const rag = statusOf(row);
     const manual = isManual(i);
     return `<tr data-id="${esc(i.id)}">
       <td class="kpi" data-label=""><span class="no">${i.star ? '<span class="star" title="Headline KPI">★</span> ' : ""}${esc(i.no)}</span> ${esc(i.text)}<div class="who">${esc(i.owner)} · target ${esc(i.target)} <span class="freq">${esc(i.freq)}</span></div></td>
-      <td><input class="inp num" data-f="actual" inputmode="decimal" aria-label="Actual for ${esc(i.no)}" value="${esc(row.actual ?? "")}" placeholder="${manual ? "value" : "actual"}" ${dis}></td>
-      <td>${manual ? `<input class="inp num" data-f="ach" inputmode="decimal" aria-label="Achievement % for ${esc(i.no)}" value="${esc(ach ?? "")}" placeholder="%" ${dis}>` : `<span class="ach" data-out="ach">${ach != null ? ach + "%" : "—"}</span>`}</td>
-      <td><select class="inp" data-f="rag" aria-label="Status for ${esc(i.no)}" ${dis}>
-        <option value="">${rag && !row.rag ? "Auto: " + RAGN[rag] : "Auto"}</option>
-        ${["G", "A", "R", "NA"].map((k) => `<option value="${k}" ${row.rag === k ? "selected" : ""}>${RAGN[k]}</option>`).join("")}
-      </select></td>
-      <td><textarea class="inp" data-f="reason" rows="1" aria-label="Reason or remarks for ${esc(i.no)}" placeholder="Reason if Amber/Red" ${dis}>${esc(row.reason || "")}</textarea></td>
+      <td>${manual ? `<span class="note">no number</span>` : `<input class="inp num" data-f="actual" inputmode="decimal" aria-label="Actual for ${esc(i.no)}" value="${esc(row.actual ?? "")}" placeholder="actual" ${dis}>`}</td>
+      <td>${manual ? `<input class="inp num" data-f="ach" inputmode="decimal" aria-label="Percent done for ${esc(i.no)}" value="${esc(ach ?? "")}" placeholder="% done" ${dis}>` : `<span class="ach" data-out="ach">${ach != null ? ach + "%" : "—"}</span>`}</td>
+      <td><span class="pill ${rag || "none"} locked" data-out="rag" title="Set automatically from Ach % (95%+ Green, 80–94% Amber, below 80% Red). It can't be changed by hand.">🔒 ${rag ? RAGN[rag] : "—"}</span></td>
+      <td><textarea class="inp" data-f="reason" rows="1" aria-label="Reason for ${esc(i.no)}" placeholder="${rag === "A" || rag === "R" ? "Reason (needed for Amber/Red)" : "Reason / remarks"}" ${dis}>${esc(row.reason || "")}</textarea>
+        <div class="files" data-files="${esc(i.id)}">${filesHtml(i.id, row, editable)}</div></td>
+      <td><textarea class="inp" data-f="next" rows="1" aria-label="Next step for ${esc(i.no)}" placeholder="${rag === "A" || rag === "R" ? "What, who, by when" : "Next step"}" ${dis}>${esc(row.next || "")}</textarea></td>
       <td><textarea class="inp" data-f="data" rows="1" aria-label="Supporting data for ${esc(i.no)}" placeholder="e.g. 46 of 50 indents" ${dis}>${esc(row.data || "")}</textarea></td>
     </tr>`;
   }).join("");
@@ -318,9 +317,9 @@ function vSubmit() {
     ${!editable ? `<div class="banner">You can view this sheet. Only ${esc(d.name)}'s HOD or an admin can change it.</div>` : ""}
     ${r ? `<div class="banner ${r.status === "submitted" ? "ok" : ""}">${r.status === "submitted" ? "Submitted" : "Draft saved"}${r.source === "whatsapp" ? " on WhatsApp" : ""} by ${esc(nameOf(r.by))} on ${esc(new Date(r.at).toLocaleString("en-IN"))}.${editable ? " You can still correct it before Saturday 5 PM." : ""}</div>` : ""}
     ${role() === "hod" ? `<p class="note">You can also send your KPIs on WhatsApp: message <b>START</b> to the company KPI number.</p>` : ""}
-    <div class="toolbar"><span class="note grow">Enter the week's actual figure. Achievement % and status fill in automatically; pick a status yourself where there is no number. ★ = headline KPI.</span>
+    <div class="toolbar"><span class="note grow">Enter the week's actual figure (or % done where a KPI has no number). Achievement % and 🔒 status are set automatically and can't be changed. For Amber/Red give the reason and the next step, and attach a voice note, photo or file as proof. ★ = headline KPI.</span>
       <label class="note"><input type="checkbox" id="showAll" ${S.showAll ? "checked" : ""}> Show monthly &amp; other KPIs</label></div>
-    <div class="tbl-wrap"><table id="resTbl" class="resp sheet"><thead><tr><th data-label="">KPI</th><th>Actual</th><th>Ach %</th><th>Status</th><th>Reason / remarks</th><th>Supporting data</th></tr></thead><tbody>${rowsHtml || `<tr><td colspan="6" class="note">No weekly KPIs. Tick “Show monthly &amp; other KPIs”.</td></tr>`}</tbody></table></div>
+    <div class="tbl-wrap"><table id="resTbl" class="resp sheet"><thead><tr><th data-label="">KPI</th><th>Actual</th><th>Ach %</th><th>Status</th><th>Reason &amp; proof</th><th>Next step</th><th>Supporting data</th></tr></thead><tbody>${rowsHtml || `<tr><td colspan="7" class="note">No weekly KPIs. Tick “Show monthly &amp; other KPIs”.</td></tr>`}</tbody></table></div>
   </section>
   <section class="two">
     <div class="panel"><h3>Last week's actions</h3><p class="note">Update each open action. Changes save straight away.</p>${actHtml}</div>
@@ -345,6 +344,80 @@ function vSubmit() {
     <button class="btn" data-act="save-draft">Save draft</button>
     <button class="btn primary" data-act="submit">Submit results</button></div>` : ""}`;
 }
+/* ---------- proof attached to a KPI: voice note, photo or file (Supabase Storage bucket "evidence") ---------- */
+const MAX_MB = 10;
+const fmtSecs = (n) => `${Math.floor(n / 60)}:${String(Math.round(n % 60)).padStart(2, "0")}`;
+function filesHtml(id, row, editable) {
+  const fs = filesOf(row);
+  const chips = fs.map((f, ix) => {
+    const kind = f.kind || kindOf(f.type);
+    const icon = kind === "voice" ? "🎤" : kind === "photo" ? "📷" : "📎";
+    const label = kind === "voice" ? `Voice${f.secs ? " " + fmtSecs(f.secs) : ""}` : f.name || kind;
+    return `<span class="fchip"><button class="link" data-act="open-file" data-path="${esc(f.path)}" title="Open ${esc(f.name || label)}">${icon} ${esc(label.length > 22 ? label.slice(0, 20) + "…" : label)}</button>${f.via === "whatsapp" ? '<span class="note"> WA</span>' : ""}${editable ? `<button class="x" data-act="rm-file" data-id="${esc(id)}" data-ix="${ix}" aria-label="Remove ${esc(label)}">✕</button>` : ""}</span>`;
+  }).join("");
+  const tools = editable ? `<span class="ftools"><button class="btn small" data-act="rec" data-id="${esc(id)}" title="Record a voice note">🎤 Voice</button><button class="btn small" data-act="pick" data-kind="photo" data-id="${esc(id)}" title="Take or choose a photo">📷 Photo</button><button class="btn small" data-act="pick" data-kind="file" data-id="${esc(id)}" title="Attach a file (PDF, Excel, …)">📎 File</button></span>` : "";
+  return chips + tools;
+}
+function refreshFiles(id) {
+  const box = document.querySelector(`[data-files="${CSS.escape(id)}"]`);
+  if (box) box.innerHTML = filesHtml(id, S.form.rows[id] || {}, mayEditDept(S.dept));
+}
+async function uploadProof(id, blob, name, extra = {}) {
+  if (blob.size > MAX_MB * 1024 * 1024) return toast(`That file is over ${MAX_MB} MB. Send a smaller one.`);
+  const safe = String(name || "file").replace(/[^\w.\-]+/g, "_").slice(-60);
+  const path = `${S.week}/${S.dept}/${id}/${Date.now()}-${safe}`;
+  toast("Uploading…");
+  const { error } = await supabase.storage.from("evidence").upload(path, blob, { contentType: blob.type || "application/octet-stream", upsert: false });
+  if (error) return toast("Couldn't upload: " + error.message);
+  const row = (S.form.rows[id] = S.form.rows[id] || {});
+  row.files = [...filesOf(row), { path, name: safe, type: blob.type || "", size: blob.size, kind: kindOf(blob.type), at: nowIso(), via: "app", ...extra }];
+  markDirty(); refreshFiles(id);
+  toast("Attached. Save draft or submit to keep it.");
+}
+function pickFile(id, kind) {
+  const inp = document.createElement("input");
+  inp.type = "file";
+  if (kind === "photo") inp.accept = "image/*";
+  inp.onchange = () => { const f = inp.files && inp.files[0]; if (f) uploadProof(id, f, f.name); };
+  inp.click();
+}
+let REC = null; // { id, rec, chunks, started, timer, btn }
+async function toggleRecording(id, btn) {
+  if (REC) { const same = REC.id === id; REC.rec.stop(); if (same) return; }
+  if (!navigator.mediaDevices || !window.MediaRecorder) return toast("This browser can't record. Use 📎 File to attach a recording instead.");
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { return toast("Microphone not allowed. Allow it in the browser settings, or attach a file."); }
+  const type = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"].find((t) => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) || "";
+  const rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+  const r = { id, rec, chunks: [], started: Date.now(), btn };
+  rec.ondataavailable = (ev) => ev.data && ev.data.size && r.chunks.push(ev.data);
+  rec.onstop = () => {
+    clearInterval(r.timer); stream.getTracks().forEach((t) => t.stop()); if (REC === r) REC = null;
+    const secs = Math.round((Date.now() - r.started) / 1000);
+    const mime = (rec.mimeType || type || "audio/webm").split(";")[0];
+    const blob = new Blob(r.chunks, { type: mime });
+    refreshFiles(id);
+    if (secs < 1 || !blob.size) return toast("Recording too short.");
+    uploadProof(id, blob, `voice-${secs}s.${mime.includes("mp4") ? "m4a" : mime.includes("ogg") ? "ogg" : "webm"}`, { secs });
+  };
+  REC = r; rec.start();
+  btn.classList.add("rec"); btn.textContent = "■ Stop 0:00";
+  r.timer = setInterval(() => { const n = (Date.now() - r.started) / 1000; btn.textContent = "■ Stop " + fmtSecs(n); if (n >= 180) rec.stop(); }, 500);
+}
+async function openFile(path) {
+  const w = window.open("", "_blank");
+  const { data, error } = await supabase.storage.from("evidence").createSignedUrl(path, 3600);
+  if (error || !data) { if (w) w.close(); return toast("Couldn't open the file: " + ((error && error.message) || "")); }
+  if (w) w.location.href = data.signedUrl; else window.location.href = data.signedUrl;
+}
+async function removeFile(id, ix) {
+  const row = S.form.rows[id]; const f = filesOf(row)[ix]; if (!f) return;
+  confirmModal(`Remove ${f.name || "this attachment"}?`, "Remove", async () => {
+    await supabase.storage.from("evidence").remove([f.path]);
+    row.files = filesOf(row).filter((_, i) => i !== ix); markDirty(); refreshFiles(id);
+  });
+}
 function markDirty() { S.formDirty = true; const n = $("#dirtyNote"); if (n) n.textContent = "Unsaved changes"; }
 function bindSubmit() {
   const tbl = $("#resTbl");
@@ -360,12 +433,14 @@ function bindSubmit() {
       const o = tr.querySelector('[data-out="ach"]'); if (o) o.textContent = row.ach != null ? row.ach + "%" : "—";
     }
     if (fld === "actual" || fld === "ach") {
-      const sel = tr.querySelector('[data-f="rag"]'); const auto = ragOf(row.ach);
-      if (sel) sel.options[0].textContent = auto ? "Auto: " + RAGN[auto] : "Auto";
+      const pill = tr.querySelector('[data-out="rag"]'); const st = statusOf(row);
+      if (pill) { pill.className = `pill ${st || "none"} locked`; pill.textContent = "🔒 " + (st ? RAGN[st] : "—"); }
+      const ph = st === "A" || st === "R";
+      const rs = tr.querySelector('[data-f="reason"]'); if (rs) rs.placeholder = ph ? "Reason (needed for Amber/Red)" : "Reason / remarks";
+      const nx = tr.querySelector('[data-f="next"]'); if (nx) nx.placeholder = ph ? "What, who, by when" : "Next step";
     }
     markDirty();
   });
-  tbl && tbl.addEventListener("change", (e) => { if (e.target.dataset.f === "rag") { const id = e.target.closest("tr").dataset.id; (S.form.rows[id] = S.form.rows[id] || {}).rag = e.target.value; markDirty(); } });
   document.querySelectorAll("[data-pri]").forEach((el) => el.addEventListener("input", () => { S.form.priorities[+el.dataset.pri] = el.value; markDirty(); }));
   const sp = $("#support"); sp && sp.addEventListener("input", () => { S.form.support = sp.value; markDirty(); });
   const sa = $("#showAll"); sa && sa.addEventListener("change", () => { S.showAll = sa.checked; render(); });
@@ -377,12 +452,17 @@ async function saveResult(status) {
   const d = S.depts[S.dept]; const f = S.form; const rows = {};
   for (const [id, r] of Object.entries(f.rows)) {
     const item = (d.items || []).find((i) => i.id === id); if (!item) continue;
-    if (!(r.actual || r.rag || r.reason || r.data || r.ach != null)) continue;
-    rows[id] = { actual: r.actual ?? "", ach: r.ach ?? null, rag: r.rag || "", reason: r.reason || "", data: r.data || "",
+    if (!hasValue(r)) continue;
+    const ach = isManual(item) ? (typeof r.ach === "number" ? r.ach : null) : calcAch(item, r.actual);
+    rows[id] = { actual: isManual(item) ? "" : r.actual ?? "", ach, reason: r.reason || "", next: r.next || "", data: r.data || "", files: filesOf(r),
       no: item.no, text: item.text, target: item.target, star: !!item.star, kraNo: item.kraNo, freq: item.freq };
   }
   if (status === "submitted") {
     if (!Object.keys(rows).length) return toast("Enter at least one KPI result before submitting.");
+    const noWhy = Object.values(rows).filter((x) => ["A", "R"].includes(statusOf(x)) && !((x.reason || "").trim() || x.files.length) );
+    if (noWhy.length) return toast(`Give a reason (text, voice, photo or file) for Amber/Red KPI ${noWhy.map((x) => x.no).join(", ")}.`);
+    const noNext = Object.values(rows).filter((x) => ["A", "R"].includes(statusOf(x)) && !(x.next || "").trim());
+    if (noNext.length) return toast(`Write the next step for Amber/Red KPI ${noNext.map((x) => x.no).join(", ")}.`);
     if (!f.ai) return toast("Check your results with Claude before submitting.");
     if (f.ai.hash !== rowsHash(f.rows)) return toast("You changed figures after Claude's check. Check again before submitting.");
     const openQ = (f.ai.flags || []).filter((x) => x.severity === "high" && !(x.answer || "").trim()).length;
@@ -558,7 +638,7 @@ function vPending() {
   acts.sort((a, b) => (a.due || "9999").localeCompare(b.due || "9999"));
   const notSub = ds.filter((d) => !(S.results[d.id] && S.results[d.id].status === "submitted"));
   const reds = [];
-  ds.forEach((d) => { const r = S.results[d.id]; if (!r) return; Object.values(r.rows || {}).forEach((x) => { const rag = x.rag || ragOf(x.ach); if (rag === "R" || rag === "A") reds.push({ d, x, rag }); }); });
+  ds.forEach((d) => { const r = S.results[d.id]; if (!r) return; Object.values(r.rows || {}).forEach((x) => { const rag = statusOf(x); if (rag === "R" || rag === "A") reds.push({ d, x, rag }); }); });
   reds.sort((a, b) => (a.rag === "R" ? 0 : 1) - (b.rag === "R" ? 0 : 1));
   const canAdd = ["admin", "hod"].includes(role());
   const actRows = acts.map((a) => {
@@ -572,7 +652,7 @@ function vPending() {
   return `<section class="panel"><div class="head-row"><div><h2>Pending points</h2><p class="sub">Everything that needs follow-up for the meeting on ${esc(fmt(S.week))}.</p></div>${canAdd ? `<button class="btn primary" data-act="add-action">Add action</button>` : ""}</div>
     <div class="two">
       <div><h3>Results not submitted</h3>${notSub.length ? `<ul class="list" style="margin-top:8px">${notSub.map((d) => `<li><span class="pill R">${S.results[d.id] ? "Draft only" : "Missing"}</span> ${esc(d.name)} <span class="note">${esc(d.hod || "")}</span></li>`).join("")}</ul>` : `<p class="note">All submitted.</p>`}</div>
-      <div><h3>Red &amp; Amber KPIs this week</h3>${reds.length ? `<ul class="list" style="margin-top:8px">${reds.slice(0, 40).map(({ d, x, rag }) => `<li><span class="pill ${rag}">${x.ach != null ? x.ach + "%" : RAGN[rag]}</span> <span><b>${esc(d.name)}</b> ${esc(x.no)} ${esc(x.text)}${x.reason ? ` <span class="note">— ${esc(x.reason)}</span>` : ""}</span></li>`).join("")}</ul>` : `<p class="note">None reported yet.</p>`}</div>
+      <div><h3>Red &amp; Amber KPIs this week</h3>${reds.length ? `<ul class="list" style="margin-top:8px">${reds.slice(0, 40).map(({ d, x, rag }) => `<li><span class="pill ${rag}">${x.ach != null ? x.ach + "%" : RAGN[rag]}</span> <span><b>${esc(d.name)}</b> ${esc(x.no)} ${esc(x.text)}${x.reason ? ` <span class="note">— ${esc(x.reason)}</span>` : ""}${x.next ? ` <span class="note">· Next: ${esc(x.next)}</span>` : ""}${filesOf(x).length ? ` <span class="pill none" title="${esc(filesSummary(x))}">📎 ${filesOf(x).length}</span>` : ""}</span></li>`).join("")}</ul>` : `<p class="note">None reported yet.</p>`}</div>
     </div></section>
   <section class="panel"><div class="head-row"><div><h3>Action tracker</h3><p class="sub">An action closes only when the result is shown.</p></div>
     <div class="toolbar">${ds.length > 1 ? `<select class="inp" id="pendDept" aria-label="Department filter" style="width:auto"><option value="all">All departments</option>${ds.map((d) => `<option value="${d.id}" ${S.pendDept === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}</select>` : ""}
@@ -786,6 +866,10 @@ $("#main").addEventListener("click", async (e) => {
     go();
   }
   else if (a === "ppt") makePpt();
+  else if (a === "rec") toggleRecording(b.dataset.id, b);
+  else if (a === "pick") pickFile(b.dataset.id, b.dataset.kind);
+  else if (a === "open-file") openFile(b.dataset.path);
+  else if (a === "rm-file") removeFile(b.dataset.id, +b.dataset.ix);
   else if (a === "save-draft") saveResult("draft");
   else if (a === "submit") saveResult("submitted");
   else if (a === "add-new") {

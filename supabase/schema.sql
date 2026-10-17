@@ -359,6 +359,51 @@ begin
 exception when undefined_table or invalid_schema_name then null;
 end $$;
 
+-- ============ Version 2.2: proof attachments + locked status ============
+
+-- Private bucket for voice notes, photos and files attached to a KPI. Path: <week>/<dept_id>/<kpi_id>/<file>
+do $$
+begin
+  begin
+    insert into storage.buckets (id, name, public, file_size_limit) values ('evidence', 'evidence', false, 10485760)
+    on conflict (id) do update set file_size_limit = excluded.file_size_limit;
+  exception when undefined_column then
+    insert into storage.buckets (id, name, public) values ('evidence', 'evidence', false) on conflict (id) do nothing;
+  end;
+exception when undefined_table or invalid_schema_name then null;
+end $$;
+
+-- Who may see / add / remove proof: same rule as the department's results (HOD = own department only).
+do $$
+begin
+  drop policy if exists evidence_read on storage.objects;
+  create policy evidence_read on storage.objects for select to authenticated
+    using (bucket_id = 'evidence' and public.can_read_dept((storage.foldername(name))[2]));
+  drop policy if exists evidence_add on storage.objects;
+  create policy evidence_add on storage.objects for insert to authenticated
+    with check (bucket_id = 'evidence' and public.can_write_dept((storage.foldername(name))[2]));
+  drop policy if exists evidence_remove on storage.objects;
+  create policy evidence_remove on storage.objects for delete to authenticated
+    using (bucket_id = 'evidence' and public.can_write_dept((storage.foldername(name))[2]));
+exception when undefined_table or invalid_schema_name or undefined_function then null;
+end $$;
+
+-- Status is LOCKED: it always comes from the achievement %. Any hand-set status is removed when saved.
+create or replace function public.lock_status() returns trigger
+language plpgsql as $$
+begin
+  if new.rows is not null and jsonb_typeof(new.rows) = 'object' then
+    new.rows := coalesce((select jsonb_object_agg(k, case when jsonb_typeof(v) = 'object' then v - 'rag' else v end)
+                          from jsonb_each(new.rows) as e(k, v)), '{}'::jsonb);
+  end if;
+  return new;
+end $$;
+drop trigger if exists results_lock_status on public.results;
+create trigger results_lock_status before insert or update on public.results
+  for each row execute function public.lock_status();
+-- clean statuses chosen by hand before this version
+update public.results set rows = rows where rows::text like '%"rag"%';
+
 -- ============ Live updates ============
 do $$
 declare t text;

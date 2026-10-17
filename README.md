@@ -1,4 +1,4 @@
-# Atlas KPI Review — version 2.1
+# Atlas KPI Review — version 2.2
 
 Weekly KRA & KPI review for the Atlas Maharani Group Monday HOD meeting.
 
@@ -7,6 +7,9 @@ Weekly KRA & KPI review for the Atlas Maharani Group Monday HOD meeting.
 - **WhatsApp chatbot:** on Saturday the bot asks each HOD their KPIs one by one, records every answer in the app, then asks Claude's clarification questions **in Malayalam** and records those answers too.
 - **Saturday 5 PM:** the PowerPoint (same format as the app's *Make PPT*) is built automatically and sent on WhatsApp.
 - **Fits every screen:** phone, tablet, laptop and PC.
+- **Status is locked.** Green / Amber / Red always comes from the achievement % (95%+ Green, 80–94% Amber, below 80% Red). Nobody can pick it by hand — not in the app, not on WhatsApp, not by editing the database. KPIs without a number are reported as **% done**.
+- **Proof on every KPI:** the HOD can attach a **voice note** (recorded in the app), a **photo** or a **file** (PDF, Excel…) as the reason — in the app, or by sending it on WhatsApp. Files are private: only that department, the admin and viewers can open them.
+- **Next step on every KPI:** Amber/Red KPIs can't be submitted without a reason (text or attachment) and a next step (what, who, by when). The bot asks both.
 
 ## What's inside
 
@@ -42,10 +45,17 @@ Weekly KRA & KPI review for the Atlas Maharani Group Monday HOD meeting.
 
 ### WhatsApp commands
 
-HOD: `START` begin/continue · `SKIP` skip a question · `BACK` previous · `STATUS` progress · `STOP` pause · `RESTART` change answers · `HELP`
+HOD: send the figure (or % done), then for Amber/Red the reason and the next step — as text, **voice note, photo or document**. A photo/voice/document sent while a KPI is being asked is attached to that KPI.
+Commands: `START` begin/continue · `SKIP` skip a question · `BACK` previous · `STATUS` progress · `STOP` pause · `RESTART` change answers · `HELP`
 Admin: `PPT` get this week's deck now · `STATUS` who has submitted
 
 ---
+
+## Upgrading from version 2.1 to 2.2 (proof attachments, locked status, next step)
+
+1. Upload the new `src/` and `supabase/` folders to GitHub (replace). Vercel rebuilds by itself.
+2. SQL Editor → run all of `supabase/schema.sql` again. It adds the private **evidence** storage (10 MB per file) and the status lock.
+3. Redeploy 4 functions with the new files from `supabase/dashboard-paste/`: `ai-check`, `ai-review`, `weekly-jobs`, `whatsapp`.
 
 ## Upgrading from version 1 (you already have the app on Vercel + Supabase)
 
