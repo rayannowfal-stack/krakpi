@@ -120,8 +120,10 @@ async function run(promise, okMsg) {
 }
 const kpiRow = (deptId, i) => ({ id: i.id, dept_id: deptId, kra_no: i.kraNo, kra: i.kra || "", kra_weight: i.kraW || 0, no: i.no, text: i.text, target: i.target,
   tv: i.tv, dir: i.dir, freq: i.freq, owner: i.owner, star: !!i.star, updated_at: nowIso() });
-async function callFn(name, body) {
-  const { data, error } = await supabase.functions.invoke(name, { body });
+async function callFn(name, body, waitSecs = 130) {
+  let timer;
+  const late = new Promise((_, no) => { timer = setTimeout(() => no(new Error("No answer after " + waitSecs + " seconds. Check your internet and try again.")), waitSecs * 1000); });
+  const { data, error } = await Promise.race([supabase.functions.invoke(name, { body }), late]).finally(() => clearTimeout(timer));
   if (error) {
     let msg = error.message;
     try { const j = await error.context.json(); msg = j.error || msg; } catch (e) {}
@@ -613,8 +615,21 @@ function mdReviewHtml(rv) {
 }
 async function runMdReview() {
   S.mdBusy = true; render();
-  try { await callFn("ai-review", { week: S.week }); await loadReview(); toast("MD review saved"); }
-  catch (e) { toast("Claude review failed: " + e.message); }
+  const before = S.review ? S.review.at : null; const t0 = Date.now();
+  try {
+    await callFn("ai-review", { week: S.week }, 90);
+    // the review is written in the background; wait for it to be saved (up to 5 minutes)
+    while (Date.now() - t0 < 300000) {
+      await new Promise((ok) => setTimeout(ok, 5000));
+      await loadReview();
+      if (S.review && S.review.at !== before) { toast("MD review ready ✓"); return; }
+      await loadAdmin();
+      const fail = (S.jobs || []).find((j) => j.job === "review" && !j.ok && new Date(j.at).getTime() > t0);
+      if (fail) throw new Error(fail.detail || "the review failed");
+      const th = document.querySelector(".thinking"); if (th) th.textContent = `Claude is reviewing all departments… ${Math.round((Date.now() - t0) / 1000)} s`;
+    }
+    throw new Error("still not ready after 5 minutes — check ai-review Logs");
+  } catch (e) { toast("Claude review failed: " + e.message); }
   finally { S.mdBusy = false; render(); }
 }
 
@@ -761,7 +776,7 @@ function vSettings() {
 async function runJob(job) {
   S.jobBusy = job; render();
   try {
-    const r = await callFn("weekly-jobs", { action: job, week: S.week });
+    const r = await callFn("weekly-jobs", { action: job, week: S.week }, 400);
     if (job === "ppt") toast(r.sent && r.sent.length ? `PPT sent to ${r.sent.length} WhatsApp number(s)` : "PPT made, but not sent: add numbers above or check WhatsApp setup");
     else if (job === "review") { toast("MD review saved"); await loadReview(); }
     else toast(`${job === "kickoff" ? "Kickoff" : "Reminder"} sent to ${(r.sent || []).length} HOD(s)${r.failed && r.failed.length ? `, ${r.failed.length} failed` : ""}`);
