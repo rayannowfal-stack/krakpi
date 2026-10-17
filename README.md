@@ -1,4 +1,4 @@
-# Atlas KPI Review — version 3
+# Atlas KPI Review — version 3.1
 
 Weekly KRA & KPI review for the Atlas Maharani Group Monday HOD meeting.
 
@@ -7,6 +7,8 @@ Weekly KRA & KPI review for the Atlas Maharani Group Monday HOD meeting.
 - **MD review by Claude is in Malayalam.**
 - **Colourful PPT** with charts, a department scoreboard, KPI tiles, the HODs' **proof photos inside the slides** and links to their files. Every HOD can make **their own department's PPT** (button *My PPT*).
 - **Saturday:** morning message to each HOD with the number of KPIs still pending (HODs who are done get nothing), 1:30 PM reminder, 5 PM PPT to the admin with **HOD-wise done / not done**.
+- **File check (MD office):** upload a department's KPI working files — **Excel (.xlsx), Word (.docx), PDF or photo**. Claude reads them, marks the figures on that department's KPIs (📂 *file: 1420 ✗* next to the HOD's own figure), and writes questions for the HOD. **Send to HOD on WhatsApp** opens a chat with the questions already typed. Paste the HOD's reply (and any file they send) → Claude judges each answer and asks follow-ups. **Use as result** puts the file's figure into the KPI if the HOD's was wrong.
+- **Phone menu:** on a phone the header is just the name and a ☰ button; week, sections, PPT, password and sign out are in the side menu.
 - **HODs see only their own department** — enforced in the database, not just hidden on screen.
 - **Login with username + password.** No email anywhere — not for HODs, not for the admin. The admin creates each login. The mobile number is only for WhatsApp.
 - **WhatsApp chatbot:** on Saturday the bot asks each HOD their KPIs one by one, records every answer in the app, then asks Claude's clarification questions **in Malayalam** and records those answers too.
@@ -55,6 +57,13 @@ Commands: `MENU` pending list · `ALL` every KPI (to change a finished one) · `
 Admin: `PPT` get this week's deck now · `STATUS` who has submitted
 
 ---
+
+## Upgrading from version 3 to 3.1 (File check + phone menu)
+
+1. Upload to GitHub (replace): `index.html`, `package.json`, and the `src` folder (it has a **new file `readfile.js`**).
+2. SQL Editor → run all of `supabase/schema.sql` again (adds the `file_checks` table).
+3. Redeploy **ai-check** with `supabase/dashboard-paste/ai-check.ts` (the other functions are unchanged).
+Old `.xls` / `.doc` files can't be read — save them as `.xlsx` / `.docx` or PDF first.
 
 ## Upgrading from version 2.2 to 3 (one KPI at a time)
 

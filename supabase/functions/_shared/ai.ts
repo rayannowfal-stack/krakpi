@@ -56,7 +56,9 @@ export async function checkKpi(b: {
   // deno-lint-ignore no-explicit-any
   storage: any; files: ProofFile[];
 }): Promise<KpiCheck> {
+  const tp = Date.now();
   const { blocks, notes } = await proofBlocks(b.storage, b.files);
+  console.log(`ai-check: proof read in ${Date.now() - tp} ms → ${blocks.length} block(s) · ${notes.join(" | ")}`);
   const prompt = `You check ONE weekly KPI result that a Head of Department (HOD) at Atlas Maharani Group (textile retail, Kerala, 24 showrooms) has just entered. It will be presented to the MD office on Monday. The MD wants RESULT-ORIENTED reporting, not "work done".
 
 KPI and the HOD's entry: ${JSON.stringify(b.kpi)}
@@ -89,6 +91,55 @@ Reply with only this JSON:
       .map((x: Record<string, unknown>) => ({ q: str(x.q ?? x.question, 500), severity: sev(x.severity), answer: "" }))
       .filter((x: { q: string }) => x.q)
       .sort((a: { severity: string }, c: { severity: string }) => order[a.severity] - order[c.severity]),
+  };
+}
+
+/* ---------- File check (admin): Claude reads a department's KPI file(s), marks figures on their KPIs, asks questions;
+   later the HOD's answers are uploaded and Claude checks them. ---------- */
+export type FileCheck = {
+  summary: string;
+  kpis: { no: string; value: string; note: string; matches: boolean | null }[];
+  questions: { q: string; kpiNo: string }[];
+  answers: { q: string; verdict: string; note: string }[];
+};
+export async function checkFiles(b: {
+  deptName: string; hod?: string; week: string; kpis: Record<string, unknown>[];
+  texts: { name: string; text: string }[]; files: ProofFile[];
+  // deno-lint-ignore no-explicit-any
+  storage: any; earlier?: { q: string; a: string }[]; answerText?: string;
+}): Promise<FileCheck> {
+  const { blocks, notes } = await proofBlocks(b.storage, b.files);
+  const texts = (b.texts || []).slice(0, 6).map((t) => `--- File "${str(t.name, 120)}" ---\n${str(t.text, 60000)}`).join("\n\n");
+  const answering = !!(b.earlier && b.earlier.length);
+  const prompt = `You are the analyst for the MD office of Atlas Maharani Group (textile retail, Kerala, 24 showrooms). The MD office has uploaded ${answering ? "the HOD's ANSWERS to earlier questions, together with" : ""} KPI working file(s) from the ${str(b.deptName, 80)} department (HOD: ${str(b.hod, 120)}) for week ${str(b.week, 40)}.
+
+The department's KPIs, and what the HOD entered in the app ("hodResult"; empty = not entered yet):
+${JSON.stringify((b.kpis || []).slice(0, 80))}
+
+Photos / PDFs (attached above): ${JSON.stringify(notes)}
+Spreadsheets / documents as text:
+${texts || "(none)"}
+${answering ? `
+Earlier questions to the HOD: ${JSON.stringify(b.earlier)}
+HOD's answer (text, may be Malayalam): ${JSON.stringify(str(b.answerText, 6000))}
+For each earlier question judge the answer: "ok" = clear and supported, "weak" = vague or not supported, "missing" = not answered.` : ""}
+
+What to do:
+1. Read every file carefully. For each KPI that the files give a figure for, report it in "kpis": the KPI number, the figure the file shows ("value", as a count, total, amount or %, e.g. "46/48" or "92%" or "1420"), whether it matches the HOD's entered result ("matches": true / false, or null when the HOD has not entered one), and a one-line Malayalam note on where it came from / what is wrong.
+2. Ask up to 6 direct questions for the HOD where the file is unclear, a figure does not match, data is missing for an important KPI, or something looks wrong. Each question names its KPI number when it is about one KPI.
+3. "summary": 2-3 short Malayalam sentences: what the files show overall and the main concern.
+Never invent figures that are not in the files.
+
+LANGUAGE: summary, every note and every question in simple, polite MALAYALAM (Malayalam script). Keep numbers, KPI numbers and business terms (ATV, UPT, GP, PO, GRN, KPI, report names) in English inside the sentence.
+
+Reply with only this JSON:
+{"summary":"<Malayalam>","kpis":[{"no":"<KPI no>","value":"<figure in file>","matches":true|false|null,"note":"<Malayalam>"}],"questions":[{"kpiNo":"<KPI no or empty>","q":"<Malayalam question>"}]${answering ? ',"answers":[{"q":"<the earlier question>","verdict":"ok"|"weak"|"missing","note":"<Malayalam>"}]' : ""}}`;
+  const res = await askClaudeJson(prompt, { model: Deno.env.get("CLAUDE_MODEL_FILES") ?? Deno.env.get("CLAUDE_MODEL_CHECK") ?? "claude-sonnet-5-5", maxTokens: 4000 }, blocks);
+  return {
+    summary: str(res.summary, 1200),
+    kpis: (Array.isArray(res.kpis) ? res.kpis : []).slice(0, 80).map((x: Record<string, unknown>) => ({ no: str(x.no, 20), value: str(x.value, 60), note: str(x.note, 400), matches: typeof x.matches === "boolean" ? x.matches : null })).filter((x: { no: string }) => x.no),
+    questions: (Array.isArray(res.questions) ? res.questions : []).slice(0, 6).map((x: Record<string, unknown>) => ({ kpiNo: str(x.kpiNo, 20), q: str(x.q ?? x.question, 500) })).filter((x: { q: string }) => x.q),
+    answers: (Array.isArray(res.answers) ? res.answers : []).slice(0, 12).map((x: Record<string, unknown>) => ({ q: str(x.q, 500), verdict: ["ok", "weak", "missing"].includes(String(x.verdict)) ? String(x.verdict) : "weak", note: str(x.note, 400) })),
   };
 }
 
@@ -139,43 +190,58 @@ const RATINGS_MAP: Record<string, true> = Object.fromEntries(RATINGS.map((r) => 
 
 export type ReviewInput = { weekLabel: string; meeting: string; repeatReds: string[]; departments: unknown[] };
 
-/** MD office review of all departments (English, for the MD office). */
+/** MD office review (Malayalam). Fast: one short Claude call per department, all at the same time,
+ * then one short call for the group view — instead of one huge call that runs past the time limit. */
 export async function reviewWeek(b: ReviewInput) {
-  let payload = JSON.stringify((b.departments || []).slice(0, 30));
-  if (payload.length > 180000) payload = payload.slice(0, 180000);
-  const prompt = `You are the analyst for the MD office of Atlas Maharani Group (textile retail, Kerala). Every Monday the heads of department (HODs) present last week's KPI results. The MD wants each department to work in a RESULT-ORIENTED way, not just do its duty. Review this week's sheets and write the MD office's view.
+  const model = Deno.env.get("CLAUDE_MODEL_REVIEW") ?? "claude-sonnet-5-5";
+  // deno-lint-ignore no-explicit-any
+  const depts = ((b.departments || []) as any[]).slice(0, 30);
+  const LANG = `LANGUAGE: write every sentence in simple, clear MALAYALAM (Malayalam script), the way the MD office talks to its managers. Keep numbers, KPI numbers, department names and business terms (ATV, UPT, GP, PO, GRN, KPI) in English inside the sentence.`;
+  const RULES = `Judge: are results measured outcomes against targets with real data, or just "work done"? Are Amber/Red KPIs explained with a real root cause ("reason") and a concrete "nextStep" (what, who, by when)? Did the HOD answer Claude's questions properly? "claude" on a KPI = what Claude found when the HOD finished it; "proof.matches": false means the attached photo/PDF does NOT support the figure — a serious point. Also look at the trend vs last week, overdue actions, unfinished KPIs. Never invent figures.`;
 
-For each department judge:
-- Are results measured outcomes against targets with real data, or activity reports ("done", "checked", "followed up")?
-- Are Amber/Red KPIs explained with a root cause ("reason") and a concrete "nextStep" with owner and date? ("attached" = voice notes/photos/files given as evidence; you cannot open them.)
-- Did the HOD answer Claude's clarification questions properly, or dodge them? (Answers may be in Malayalam.)
-- Trend vs last week's score, overdue actions, KPIs Red two weeks running.
-- A department with a missing sheet should be called out.
-- Each KPI row may carry "claude": what Claude found when the HOD finished that KPI (verdict ok/doubt/weak, and "proof" = what Claude read in the attached photo/PDF, with "matches" true/false against the HOD's figure). A proof that does not match the figure is a serious point for the MD.
-Questions for Monday must be direct and specific to a KPI or figure. Suggestions must be practical for a textile retail chain. Never invent figures not in the data.
-
-LANGUAGE: Write "headline", "groupView", every "watchList" item, every "verdict", every "question", every "suggestion" and every "crossDept" item in simple, clear MALAYALAM (Malayalam script), the way the MD office talks to its managers. Keep numbers, KPI numbers, department names and business terms (ATV, UPT, GP, PO, GRN, KPI) in English inside the Malayalam sentence. "rating" stays exactly one of the three English labels, and "dept" stays the id from the data.
-
-Week: ${str(b.weekLabel, 40)} (meeting ${str(b.meeting, 40)})
-Red two weeks running: ${JSON.stringify(strArr(b.repeatReds, 60))}
-Departments (JSON): ${payload}
-
+  const one = async (d: Record<string, unknown>) => {
+    if (d.sheet === "missing" || !(d.rows as unknown[] || []).length) return { dept: str(d.id, 80), rating: "Activity only", verdict: "ഈ ആഴ്ച ഈ വകുപ്പ് KPI റിപ്പോർട്ട് നൽകിയിട്ടില്ല.", questions: ["എന്തുകൊണ്ടാണ് ഈ ആഴ്ച KPI റിപ്പോർട്ട് നൽകാതിരുന്നത്?"], suggestions: [] };
+    let data = JSON.stringify(d); if (data.length > 40000) data = data.slice(0, 40000);
+    const prompt = `You are the analyst for the MD office of Atlas Maharani Group (textile retail, Kerala, 24 showrooms). Review ONE department's weekly KPI report for the Monday HOD meeting (week ${str(b.weekLabel, 40)}, meeting ${str(b.meeting, 40)}).
+${RULES}
+Department data: ${data}
+${LANG}
 Reply with only this JSON:
-{"headline":"<one sentence, the most important thing for the MD this week>","groupView":"<3 short sentences on the group overall>","watchList":["<a person, KPI or issue the MD office must follow this week>"],"departments":[{"dept":"<id from the data>","rating":"Result-oriented" | "Partly result-oriented" | "Activity only","verdict":"<2 sentences>","questions":["<question to ask the HOD on Monday>"],"suggestions":["<practical suggestion>"]}],"crossDept":["<issue between departments, e.g. Purchase stock vs Sales availability>"]}
-One entry per department in the data, in the same order. Up to 3 questions and 3 suggestions per department, up to 5 watch-list items, up to 4 cross-department items.`;
+{"rating":"Result-oriented" | "Partly result-oriented" | "Activity only","verdict":"<2 short sentences in Malayalam>","questions":["<up to 3 direct questions to ask this HOD on Monday, Malayalam>"],"suggestions":["<up to 2 practical suggestions, Malayalam>"]}`;
+    try {
+      const r = await askClaudeJson(prompt, { model, maxTokens: 1500 });
+      return { dept: str(d.id, 80), rating: RATINGS.includes(String(r.rating)) ? String(r.rating) : "Partly result-oriented", verdict: str(r.verdict, 600), questions: strArr(r.questions, 3), suggestions: strArr(r.suggestions, 2) };
+    } catch (e) {
+      console.error("review: department failed", d.id, e instanceof Error ? e.message : e);
+      return { dept: str(d.id, 80), rating: "Partly result-oriented", verdict: "Claude-ന് ഈ വകുപ്പ് ഇപ്പോൾ വിലയിരുത്താനായില്ല.", questions: [], suggestions: [] };
+    }
+  };
+  const t0 = Date.now();
+  // all departments in parallel (4 at a time)
+  const out: Awaited<ReturnType<typeof one>>[] = new Array(depts.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(4, depts.length) }, async () => { while (next < depts.length) { const i = next++; out[i] = await one(depts[i]); } }));
+  console.log(`review: ${depts.length} departments in ${Date.now() - t0} ms`);
 
-  const res = await askClaudeJson(prompt, { model: Deno.env.get("CLAUDE_MODEL_REVIEW") ?? "claude-opus-5-5", maxTokens: 8000 });
+  const brief = depts.map((d, i) => ({ dept: d.name, sheet: d.sheet, score: d.score, lastWeekScore: d.lastWeekScore, rating: out[i]?.rating, verdict: out[i]?.verdict,
+    // deno-lint-ignore no-explicit-any
+    red: ((d.rows || []) as any[]).filter((x) => x.status === "Red").map((x) => `${x.no} ${x.kpi}`).slice(0, 8),
+    // deno-lint-ignore no-explicit-any
+    proofMismatch: ((d.rows || []) as any[]).filter((x) => x.claude && x.claude.proof && x.claude.proof.matches === false).map((x) => x.no),
+    // deno-lint-ignore no-explicit-any
+    overdueActions: ((d.openActions || []) as any[]).filter((a) => a.overdue).length }));
+  const prompt = `You are the analyst for the MD office of Atlas Maharani Group (textile retail, Kerala). Write the group view of this week's HOD reports (week ${str(b.weekLabel, 40)}, meeting ${str(b.meeting, 40)}).
+Departments (already reviewed one by one): ${JSON.stringify(brief).slice(0, 30000)}
+KPIs Red two weeks running: ${JSON.stringify(strArr(b.repeatReds, 40))}
+${LANG}
+Reply with only this JSON:
+{"headline":"<one sentence: the most important thing for the MD this week>","groupView":"<3 short sentences on the group overall>","watchList":["<up to 5 people / KPIs / issues the MD office must follow this week>"],"crossDept":["<up to 3 issues between departments, e.g. Purchase stock vs Sales>"]}`;
+  let g: Record<string, unknown> = {};
+  try { g = await askClaudeJson(prompt, { model, maxTokens: 1500 }); }
+  catch (e) { console.error("review: group view failed", e instanceof Error ? e.message : e); }
+  console.log(`review: finished in ${Date.now() - t0} ms`);
   return {
-    headline: str(res.headline, 400),
-    groupView: str(res.groupView, 1200),
-    watchList: strArr(res.watchList, 5),
-    crossDept: strArr(res.crossDept, 4),
-    departments: (Array.isArray(res.departments) ? res.departments : []).map((x: Record<string, unknown>) => ({
-      dept: str(x.dept, 80),
-      rating: RATINGS.includes(String(x.rating)) ? String(x.rating) : "Partly result-oriented",
-      verdict: str(x.verdict, 600),
-      questions: strArr(x.questions, 3),
-      suggestions: strArr(x.suggestions, 3),
-    })),
+    headline: str(g.headline, 400), groupView: str(g.groupView, 1200), watchList: strArr(g.watchList, 5), crossDept: strArr(g.crossDept, 4),
+    departments: out.filter(Boolean),
   };
 }

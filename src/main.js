@@ -10,6 +10,7 @@ import {
   mapResult, mapAction, mapProposal, repeatReds, normPhone, normUsername, userLogin,
 } from "../supabase/functions/_shared/core.js";
 import { buildDeck } from "../supabase/functions/_shared/ppt-builder.js";
+import { readForClaude, kindOfFile } from "./readfile.js";
 
 /* ---------- helpers ---------- */
 const LS = {
@@ -22,7 +23,7 @@ const $ = (s) => document.querySelector(s);
 const today = () => ymd(new Date());
 const nowIso = () => new Date().toISOString();
 const when = (iso) => (iso ? new Date(iso).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "");
-const TABS = { admin: ["overview", "submit", "weekly", "master", "pending", "md", "users", "settings"], viewer: ["overview", "submit", "master", "pending", "md"], hod: ["submit", "pending", "master"] };
+const TABS = { admin: ["overview", "submit", "files", "weekly", "master", "pending", "md", "users", "settings"], viewer: ["overview", "submit", "files", "master", "pending", "md"], hod: ["submit", "pending", "master"] };
 
 /* ---------- state ---------- */
 const S = {
@@ -32,6 +33,7 @@ const S = {
   showAll: false, weeklyDept: LS.get("wdept", "all"), masterDept: LS.get("mdept", "sales"), q: "",
   pendFilter: "open", pendDept: "all",
   kpiOpen: null, edit: null, scope: "weekly", mdBusy: false, jobBusy: "", channel: null,
+  checks: [], fcBusy: "", fcDept: LS.get("fcdept", "sales"),
 };
 const deptList = () => deptListOf(S.depts);
 const nameOf = (uid) => { const p = S.profiles.find((x) => x.id === uid); return p ? p.full_name || p.username || p.phone : uid ? "a team member" : ""; };
@@ -92,12 +94,17 @@ async function loadAdmin() {
   S.settings = st; S.jobs = jobs || [];
 }
 async function loadScope() { try { const { data } = await supabase.rpc("kpi_scope"); S.scope = data === "headline" ? "headline" : "weekly"; } catch (e) { S.scope = "weekly"; } }
-async function loadAll() { await Promise.all([loadDepts(), loadProposals(), loadActions(), loadProfiles(), loadResults(), loadReview(), loadAdmin(), loadScope()]); }
+async function loadChecks() {
+  if (!["admin", "viewer"].includes(role())) { S.checks = []; return; }
+  const { data } = await supabase.from("file_checks").select("*").eq("week", S.week).order("created_at", { ascending: false });
+  S.checks = data || [];
+}
+async function loadAll() { await Promise.all([loadChecks(), loadDepts(), loadProposals(), loadActions(), loadProfiles(), loadResults(), loadReview(), loadAdmin(), loadScope()]); }
 
 function subscribe() {
   if (S.channel) supabase.removeChannel(S.channel);
   const pending = new Set(); let t;
-  const loaders = { departments: loadDepts, kpis: loadDepts, proposals: loadProposals, actions: loadActions, results: loadResults, reviews: loadReview, profiles: loadProfiles, job_runs: loadAdmin };
+  const loaders = { departments: loadDepts, kpis: loadDepts, proposals: loadProposals, actions: loadActions, results: loadResults, reviews: loadReview, profiles: loadProfiles, job_runs: loadAdmin, file_checks: loadChecks };
   S.channel = supabase.channel("kpi-live").on("postgres_changes", { event: "*", schema: "public" }, (p) => {
     pending.add(p.table); clearTimeout(t);
     t = setTimeout(async () => {
@@ -195,7 +202,36 @@ function renderHeader() {
   $("#pptBtn").textContent = role() === "hod" ? "My PPT" : "Make PPT";
   const deptName = S.me && S.me.dept_id && S.depts[S.me.dept_id] ? " · " + S.depts[S.me.dept_id].name : "";
   $("#roleChip").textContent = (ROLES[role()] || "") + (role() === "hod" ? deptName : "");
+  renderDrawer();
 }
+/* phone: side menu (☰) with week, sections, PPT, password and sign out */
+const TAB_NAMES = { overview: "Overview", submit: "Results", files: "File check", weekly: "Weekly KPI list", master: "KRA & KPI", pending: "Pending points", md: "MD Office", users: "Users", settings: "Settings" };
+const tabName = (t) => (t === "submit" && role() === "hod" ? "My KPIs" : TAB_NAMES[t] || t);
+function renderDrawer() {
+  $("#dName").textContent = (S.me && (S.me.full_name || S.me.username)) || "";
+  $("#dRole").textContent = $("#roleChip").textContent;
+  $("#dMeet").textContent = "Meeting " + fmt(S.week); $("#dRange").textContent = weekRange(S.week);
+  $("#dTabs").innerHTML = (TABS[role()] || []).map((t) => `<button data-dtab="${t}" aria-current="${t === S.tab ? "page" : "false"}">${esc(tabName(t))}</button>`).join("");
+  $("#dPpt").textContent = role() === "hod" ? "📊 My PPT" : "📊 Make PPT";
+  $("#dPpt").hidden = $("#pptBtn").hidden;
+  $("#pageTitle").textContent = tabName(S.tab);
+}
+function drawer(open) {
+  document.body.classList.toggle("drawer-open", open);
+  $("#drawer").setAttribute("aria-hidden", open ? "false" : "true"); $("#menuBtn").setAttribute("aria-expanded", String(open));
+  $("#drawerBg").hidden = !open;
+  if (open) { renderDrawer(); setTimeout(() => { const c = $("#dTabs [aria-current='page']") || $("#drawerClose"); c && c.focus(); }, 50); }
+}
+$("#menuBtn").onclick = () => drawer(true);
+$("#drawerClose").onclick = () => drawer(false);
+$("#drawerBg").onclick = () => drawer(false);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && document.body.classList.contains("drawer-open")) drawer(false); });
+$("#dTabs").addEventListener("click", (e) => { const b = e.target.closest("[data-dtab]"); if (!b) return; S.tab = b.dataset.dtab; LS.set("tab", S.tab); S.kpiOpen = null; drawer(false); render(); window.scrollTo(0, 0); });
+$("#dPrev").onclick = () => { setWeek(addDays(S.week, -7)); renderDrawer(); };
+$("#dNext").onclick = () => { setWeek(addDays(S.week, 7)); renderDrawer(); };
+$("#dPpt").onclick = () => { drawer(false); makePpt(role() === "hod" ? S.me.dept_id : null); };
+$("#dPw").onclick = () => { drawer(false); passwordModal(); };
+$("#dOut").onclick = () => { drawer(false); supabase.auth.signOut(); };
 $("#wkPrev").onclick = () => setWeek(addDays(S.week, -7));
 $("#wkNext").onclick = () => setWeek(addDays(S.week, 7));
 $("#tabs").addEventListener("click", (e) => { const b = e.target.closest("button[data-tab]"); if (!b) return; S.tab = b.dataset.tab; LS.set("tab", S.tab); render(); });
@@ -205,7 +241,7 @@ $("#myPw").onclick = () => passwordModal();
 
 async function setWeek(w) {
   S.week = w; S.kpiOpen = null; S.edit = null; S.results = {}; S.prev = {}; S.review = null; render();
-  await Promise.all([loadResults(), loadReview()]); render();
+  await Promise.all([loadResults(), loadReview(), loadChecks()]); render();
 }
 
 /* ---------- render ---------- */
@@ -222,7 +258,8 @@ function render() {
   if (!S.depts[S.masterDept]) S.masterDept = deptList()[0].id;
   const allowed = TABS[role()] || [];
   if (!allowed.includes(S.tab)) S.tab = allowed[0];
-  const fn = { overview: vOverview, submit: vSubmit, weekly: vWeekly, master: vMaster, pending: vPending, md: vMD, users: vUsers, settings: vSettings }[S.tab] || vOverview;
+  if (!S.depts[S.fcDept]) S.fcDept = deptList()[0].id;
+  const fn = { overview: vOverview, submit: vSubmit, files: vFiles, weekly: vWeekly, master: vMaster, pending: vPending, md: vMD, users: vUsers, settings: vSettings }[S.tab] || vOverview;
   renderHeader();
   m.innerHTML = fn();
   labelTables(m);
@@ -289,6 +326,7 @@ const STATE_TXT = {
   todo: ["To fill", "പൂരിപ്പിക്കാനുണ്ട്", "none"], "need-reason": ["Add reason", "കാരണം വേണം", "R"], "need-next": ["Add next step", "അടുത്ത നടപടി വേണം", "R"],
   "need-check": ["Check with Claude", "Claude പരിശോധന", "A"], "need-answer": ["Answer Claude", "Claude-ന് മറുപടി", "A"], ready: ["Ready — tap Finish", "പൂർത്തിയാക്കാം", "G"], done: ["Done", "പൂർത്തിയായി", "G"],
 };
+const auditPill = (a) => `<span class="pill ${a.matches === true ? "G" : a.matches === false ? "R" : "none"}" title="${esc(a.note || "")}">📂 file: ${esc(a.value)}${a.matches === true ? " ✓" : a.matches === false ? " ✗" : ""}</span>`;
 const VERDICT = { ok: ["Clear", "G"], doubt: ["Needs clarity", "A"], weak: ["Weak / not proved", "R"], skipped: ["Not checked", "none"] };
 const scopeNow = () => S.scope || "weekly";
 const progress = (deptId) => progressOf(S.depts[deptId], (S.results[deptId] || {}).rows || {}, scopeNow());
@@ -307,7 +345,8 @@ function vSubmit() {
       <span class="kn">${x.state === "done" ? "✓" : i + 1}</span>
       <span class="kt"><b>${x.item.star ? '<span class="star">★</span> ' : ""}${esc(x.item.text)}</b>
         <small>KPI ${esc(x.item.no)} · target ${esc(x.item.target)}</small>
-        ${x.row && (x.row.ach != null || x.row.actual) ? `<small>${resultText(x.item, x.row)} ${rag ? `<span class="pill ${rag}">🔒 ${RAGN[rag]}</span>` : ""}${filesOf(x.row).length ? ` <span class="pill none">📎 ${filesOf(x.row).length}</span>` : ""}${x.row.ai ? ` <span class="pill ${(VERDICT[x.row.ai.verdict] || VERDICT.doubt)[1]}">Claude: ${(VERDICT[x.row.ai.verdict] || VERDICT.doubt)[0]}</span>` : ""}</small>` : ""}</span>
+        ${x.row && (x.row.ach != null || x.row.actual) ? `<small>${resultText(x.item, x.row)} ${rag ? `<span class="pill ${rag}">🔒 ${RAGN[rag]}</span>` : ""}${filesOf(x.row).length ? ` <span class="pill none">📎 ${filesOf(x.row).length}</span>` : ""}${x.row.ai ? ` <span class="pill ${(VERDICT[x.row.ai.verdict] || VERDICT.doubt)[1]}">Claude: ${(VERDICT[x.row.ai.verdict] || VERDICT.doubt)[0]}</span>` : ""}</small>` : ""}
+        ${x.row && x.row.audit ? `<small>${auditPill(x.row.audit)}</small>` : ""}</span>
       <span class="ks"><span class="pill ${st[2]}">${st[0]}</span><small class="ml">${st[1]}</small></span>
     </button>`;
   };
@@ -358,6 +397,7 @@ function vKpi() {
     <div><h2>${item.star ? '<span class="star">★</span> ' : ""}${esc(item.text)}</h2>
       <p class="sub">KPI ${esc(item.no)} · ${esc(item.owner)} · <span class="freq">${esc(FREQ[item.freq] || item.freq)}</span></p></div>
     <div class="target"><span>Target</span><b>${esc(item.target)}</b></div>
+    ${row.audit ? `<div class="proofread ${row.audit.matches === true ? "G" : row.audit.matches === false ? "R" : "none"}"><b>📂 MD office file check:</b> the file shows <b>${esc(row.audit.value)}</b>${row.audit.matches === true ? " — matches ✓" : row.audit.matches === false ? " — does NOT match your figure ✗" : ""}<div class="ml">${esc(row.audit.note || "")}</div></div>` : ""}
 
     <div class="step"><span class="sn">1</span><div class="grow">
       <label class="f big">${kind === "pct" ? (isManual(item) ? "How much is done? (%)" : "Result this week (%)") : "Result this week (number)"}
@@ -631,6 +671,150 @@ async function runMdReview() {
     throw new Error("still not ready after 5 minutes — check ai-review Logs");
   } catch (e) { toast("Claude review failed: " + e.message); }
   finally { S.mdBusy = false; render(); }
+}
+
+/* ---------- File check (MD office): upload a department's KPI files → Claude marks KPIs + asks questions → HOD answers → Claude checks ---------- */
+const ANSV = { ok: ["Answered ✓", "G"], weak: ["Weak answer", "A"], missing: ["Not answered", "R"] };
+const hodOf = (deptId) => S.profiles.find((p) => p.role === "hod" && p.dept_id === deptId);
+function vFiles() {
+  const ds = deptList(); const d = S.depts[S.fcDept]; const admin = S.isAdmin;
+  const list = S.checks.filter((c) => c.dept_id === S.fcDept);
+  const chips = `<div class="chips" role="group" aria-label="Department">${ds.map((x) => { const n = S.checks.filter((c) => c.dept_id === x.id).length; return `<button class="chip" data-act="fc-dept" data-dept="${x.id}" aria-pressed="${x.id === S.fcDept}">${esc(x.name)}${n ? ` <small>${n}</small>` : ""}</button>`; }).join("")}</div>`;
+  return `<section class="panel">
+    <div class="head-row"><div><h2>File check · ${esc(d.name)}</h2><p class="sub">Upload the department's KPI working file — Excel, Word, PDF or photo. Claude reads it, marks the figures on their KPIs, compares with what the HOD entered, and writes questions for the HOD. When the HOD replies, add the answer and Claude checks it.</p></div>${chips}</div>
+    ${admin ? `<div class="fc-new">
+      <label class="f wide">Title <span class="note">(optional)</span><input class="inp" id="fcTitle" value="${esc(S.fcTitle || "")}" placeholder="e.g. Sales branch report week 42"></label>
+      <div class="f"><span>Files</span><div class="toolbar"><button class="btn" data-act="fc-pick" data-target="new">📎 Choose files</button><span class="note grow" id="fcNewList">${esc((S.fcPending.new || []).map((f) => f.name).join(", ") || "Excel (.xlsx), Word (.docx), PDF, photo — up to 6")}</span></div></div>
+      <div><button class="btn primary" data-act="fc-run" ${S.fcBusy ? "disabled" : ""}>${S.fcBusy === "new" ? "Claude is reading the files…" : "Analyse with Claude"}</button></div>
+      ${S.fcBusy === "new" ? `<div class="thinking">Claude is reading ${esc((S.fcPending.new || []).length)} file(s)… this takes up to a minute.</div>` : ""}
+    </div>` : `<p class="note">Only the MD office (admin) can run a file check.</p>`}
+  </section>
+  ${list.length ? list.map((c) => fcCard(c, d, admin)).join("") : `<section class="panel"><p class="note">No file checks for ${esc(d.name)} this week yet.</p></section>`}`;
+}
+function fcCard(c, d, admin) {
+  const rounds = c.rounds || []; const last = rounds[rounds.length - 1] || {}; const res = last.result || {};
+  const firstFiles = rounds.flatMap((r) => r.files || []);
+  const qs = res.questions || [];
+  const hod = hodOf(c.dept_id);
+  const msg = `നമസ്കാരം ${hod ? hod.full_name || "" : ""}, ${d.name} — KPI ഫയൽ പരിശോധന (${weekRange(c.week)}). ദയവായി ഈ ചോദ്യങ്ങൾക്ക് മറുപടി അയക്കുക:\n` + qs.map((q, i) => `${i + 1}. ${q.kpiNo ? "KPI " + q.kpiNo + ": " : ""}${q.q}`).join("\n");
+  const wa = hod && hod.phone && qs.length ? `https://wa.me/${hod.phone}?text=${encodeURIComponent(msg)}` : "";
+  const items = d.items || [];
+  const kpiRow = (k) => {
+    const it = items.find((i) => String(i.no) === String(k.no)); const row = it && S.results[c.dept_id] ? S.results[c.dept_id].rows[it.id] : null;
+    return `<tr><td class="kpi" data-label=""><b>${esc(k.no)}</b> ${esc(it ? it.text : "")}</td><td><b>${esc(k.value)}</b></td><td>${row && (row.actual || row.ach != null) ? `${esc(row.actual || "")}${row.ach != null ? " → " + row.ach + "%" : ""}` : `<span class="note">not entered</span>`}</td>
+      <td>${k.matches === true ? `<span class="pill G">✓ matches</span>` : k.matches === false ? `<span class="pill R">✗ different</span>` : `<span class="pill none">—</span>`}</td><td class="ml">${esc(k.note)}</td>
+      <td>${admin && it ? `<button class="btn small" data-act="fc-use" data-id="${esc(c.id)}" data-kpi="${esc(it.id)}" data-value="${esc(k.value)}" title="Put this figure into the KPI result">Use as result</button>` : ""}</td></tr>`;
+  };
+  return `<section class="panel fc">
+    <div class="head-row"><div><h3>📂 ${esc(c.title || "File check")}</h3><p class="sub">${esc(new Date(c.created_at).toLocaleString("en-IN"))} · ${rounds.length} round${rounds.length > 1 ? "s" : ""} · ${c.status === "closed" ? "closed" : "open"}</p></div>
+      ${admin ? `<div class="toolbar"><button class="btn small ghost" data-act="fc-close" data-id="${esc(c.id)}">${c.status === "closed" ? "Re-open" : "Close"}</button><button class="btn small ghost danger" data-act="fc-del" data-id="${esc(c.id)}">Delete</button></div>` : ""}</div>
+    <div class="files">${firstFiles.map((f) => `<span class="fchip"><button class="link" data-act="open-file" data-path="${esc(f.path)}">${f.kind === "photo" ? "📷" : "📎"} ${esc(f.name)}</button></span>`).join("")}</div>
+    ${res.summary ? `<p class="ml" style="margin:0"><b>Claude:</b> ${esc(res.summary)}</p>` : ""}
+    ${(res.answers || []).length ? `<div class="flags">${res.answers.map((a) => { const v = ANSV[a.verdict] || ANSV.weak; return `<div class="qa ml"><span class="pill ${v[1]}">${v[0]}</span> <b>${esc(a.q)}</b><div>${esc(a.note)}</div></div>`; }).join("")}</div>` : ""}
+    ${(res.kpis || []).length ? `<h3>Marked on KPIs (${res.kpis.length})</h3><div class="tbl-wrap"><table class="resp"><thead><tr><th data-label="">KPI</th><th>File shows</th><th>HOD entered</th><th>Match</th><th>Note</th><th></th></tr></thead><tbody>${res.kpis.map(kpiRow).join("")}</tbody></table></div>` : ""}
+    ${qs.length ? `<h3>Questions for the HOD (${qs.length})</h3><ol class="ml fcq">${qs.map((q) => `<li>${q.kpiNo ? `<b>KPI ${esc(q.kpiNo)}:</b> ` : ""}${esc(q.q)}</li>`).join("")}</ol>
+      <div class="toolbar"><button class="btn" data-act="fc-copy" data-id="${esc(c.id)}">📋 Copy questions</button>${wa ? `<a class="btn wa" href="${esc(wa)}" target="_blank" rel="noopener">💬 Send to ${esc(hod.full_name || "HOD")} on WhatsApp</a>` : `<span class="note">${hod ? "Add the HOD's WhatsApp number in Users to send directly." : "No HOD login for this department yet."}</span>`}</div>` : (res.summary ? `<p class="note">No questions — Claude found the files clear.</p>` : "")}
+    ${admin && c.status !== "closed" && qs.length ? `<div class="fc-ans">
+      <label class="f wide">HOD's answer <span class="note">(paste the WhatsApp reply)</span><textarea class="inp" id="fcAns-${esc(c.id)}" rows="3" placeholder="Paste the HOD's reply here">${esc((S.fcDraft || {})[c.id] || "")}</textarea></label>
+      <div class="toolbar"><button class="btn" data-act="fc-pick" data-target="${esc(c.id)}">📎 Add answer file</button><span class="note grow">${esc(((S.fcPending || {})[c.id] || []).map((f) => f.name).join(", "))}</span>
+        <button class="btn primary" data-act="fc-answer" data-id="${esc(c.id)}" ${S.fcBusy ? "disabled" : ""}>${S.fcBusy === c.id ? "Claude is checking…" : "Check answer with Claude"}</button></div>
+      ${S.fcBusy === c.id ? `<div class="thinking">Claude is checking the HOD's answer…</div>` : ""}</div>` : ""}
+    ${rounds.length > 1 ? `<details><summary class="note">Earlier rounds (${rounds.length - 1})</summary>${rounds.slice(0, -1).map((r, i) => `<div class="qa ml"><b>Round ${i + 1} · ${r.kind === "answer" ? "HOD answer" : "files"} · ${esc(new Date(r.at).toLocaleString("en-IN"))}</b>${r.answerText ? `<div>“${esc(r.answerText)}”</div>` : ""}<div>${esc((r.result || {}).summary || "")}</div>${((r.result || {}).questions || []).map((q) => `<div>• ${esc(q.q)}</div>`).join("")}</div>`).join("")}</details>` : ""}
+  </section>`;
+}
+S.fcPending = {}; S.fcDraft = {};
+function fcPick(target) {
+  const inp = document.createElement("input"); inp.type = "file"; inp.multiple = true;
+  inp.accept = ".xlsx,.docx,.csv,.txt,.pdf,image/*,application/pdf";
+  inp.onchange = () => { S.fcPending[target] = [...inp.files].slice(0, 6); render(); };
+  inp.click();
+}
+/** Uploads the chosen files, turns Excel/Word into text, and returns { files (photos/PDFs for Claude to read), stored (all), texts }. */
+async function fcPrepare(list, deptId) {
+  const files = [], stored = [], texts = [];
+  for (const f of list) {
+    const k = kindOfFile(f.name, f.type);
+    const r = await readForClaude(f); // throws a friendly message for .xls/.doc
+    if (f.size > 10 * 1024 * 1024) throw new Error(`${f.name} is over 10 MB.`);
+    const safe = f.name.replace(/[^\w.\-]+/g, "_").slice(-60);
+    const path = `${S.week}/${deptId}/_files/${Date.now()}-${safe}`;
+    const { error } = await supabase.storage.from("evidence").upload(path, f, { contentType: f.type || "application/octet-stream", upsert: false });
+    if (error) throw new Error(`Couldn't upload ${f.name}: ${error.message}`);
+    const meta = { path, name: f.name, type: f.type || "", kind: k === "photo" ? "photo" : "file", size: f.size };
+    stored.push(meta);
+    if (k === "photo" || k === "pdf") files.push(meta); else texts.push({ name: f.name, text: r.text });
+  }
+  return { files, stored, texts };
+}
+function fcKpis(deptId) {
+  const d = S.depts[deptId]; const rows = (S.results[deptId] || {}).rows || {};
+  return itemsFor(d, true).map((i) => ({ no: i.no, kpi: i.text, target: i.target, frequency: FREQ[i.freq] || i.freq, hodResult: rows[i.id] && (rows[i.id].actual || rows[i.id].ach != null) ? `${rows[i.id].actual || ""}${rows[i.id].ach != null ? " (" + rows[i.id].ach + "%)" : ""}` : "" }));
+}
+/** Marks Claude's figures on the KPIs (an "MD office file check" note on each KPI; the HOD's own figure is not changed). */
+async function fcMark(c, result) {
+  const d = S.depts[c.dept_id];
+  for (const k of result.kpis || []) {
+    const it = (d.items || []).find((i) => String(i.no) === String(k.no)); if (!it) continue;
+    const old = ((S.results[c.dept_id] || {}).rows || {})[it.id] || {};
+    const row = { ...old, no: it.no, text: it.text, target: it.target, star: !!it.star, kraNo: it.kraNo, freq: it.freq, files: filesOf(old), audit: { value: k.value, matches: k.matches, note: k.note, at: nowIso(), check: c.id } };
+    delete row.rag;
+    await supabase.rpc("save_kpi", { p_week: c.week, p_dept: c.dept_id, p_kpi: it.id, p_row: row, p_source: old.updated_at ? (S.results[c.dept_id] || {}).source || "app" : "app", p_complete: null });
+  }
+  await loadResults();
+}
+async function fcRun() {
+  const list = S.fcPending.new || []; if (!list.length) return toast("Choose the file(s) first.");
+  const deptId = S.fcDept; const d = S.depts[deptId];
+  S.fcBusy = "new"; render();
+  try {
+    const prep = await fcPrepare(list, deptId);
+    const result = await callFn("ai-check", { mode: "files", deptId, week: S.week, weekLabel: weekRange(S.week), deptName: d.name, hod: d.hod, kpis: fcKpis(deptId), files: prep.files, texts: prep.texts });
+    const title = ($("#fcTitle") && $("#fcTitle").value.trim()) || list.map((f) => f.name).join(", ").slice(0, 120);
+    const { data, error } = await supabase.from("file_checks").insert({ week: S.week, dept_id: deptId, title, rounds: [{ at: nowIso(), kind: "file", files: prep.stored, texts: prep.texts, result }] }).select().single();
+    if (error) throw new Error(error.message);
+    await fcMark(data || { id: "", week: S.week, dept_id: deptId }, result);
+    S.fcPending.new = []; S.fcTitle = ""; await loadChecks();
+    toast(`Claude marked ${result.kpis.length} KPI(s) and wrote ${result.questions.length} question(s)`);
+  } catch (e) { toast("File check failed: " + e.message); }
+  finally { S.fcBusy = ""; render(); }
+}
+async function fcAnswer(id) {
+  const c = S.checks.find((x) => x.id === id); if (!c) return;
+  const ans = ($("#fcAns-" + id) || {}).value || ""; S.fcDraft[id] = ans;
+  const list = S.fcPending[id] || [];
+  if (!ans.trim() && !list.length) return toast("Paste the HOD's answer or add the answer file.");
+  const d = S.depts[c.dept_id]; const rounds = c.rounds || []; const last = rounds[rounds.length - 1] || {};
+  S.fcBusy = id; render();
+  try {
+    const prep = await fcPrepare(list, c.dept_id);
+    const allFiles = [...rounds.flatMap((r) => (r.files || []).filter((f) => f.kind === "photo" || /pdf/.test(f.type || ""))), ...prep.files].slice(-6);
+    const allTexts = [...rounds.flatMap((r) => r.texts || []), ...prep.texts].slice(-6);
+    const result = await callFn("ai-check", { mode: "files", deptId: c.dept_id, week: c.week, weekLabel: weekRange(c.week), deptName: d.name, hod: d.hod, kpis: fcKpis(c.dept_id),
+      files: allFiles, texts: allTexts, earlier: ((last.result || {}).questions || []).map((q) => ({ q: (q.kpiNo ? "KPI " + q.kpiNo + ": " : "") + q.q, a: "" })), answerText: ans });
+    const { error } = await supabase.from("file_checks").update({ rounds: [...rounds, { at: nowIso(), kind: "answer", files: prep.stored, texts: prep.texts, answerText: ans, result }], updated_at: nowIso() }).eq("id", id);
+    if (error) throw new Error(error.message);
+    await fcMark(c, result);
+    S.fcPending[id] = []; S.fcDraft[id] = ""; await loadChecks();
+    toast(result.questions.length ? `Checked — ${result.questions.length} follow-up question(s)` : "Checked — all clear ✓");
+  } catch (e) { toast("Answer check failed: " + e.message); }
+  finally { S.fcBusy = ""; render(); }
+}
+async function fcUse(id, kpiId, value) {
+  const c = S.checks.find((x) => x.id === id); const d = S.depts[c.dept_id]; const it = d.items.find((i) => i.id === kpiId);
+  const r = resultFrom(it, value); if (!r) return toast("Claude's figure is not a number — enter it on the KPI by hand.");
+  const old = ((S.results[c.dept_id] || {}).rows || {})[kpiId] || {};
+  confirmModal(`Set KPI ${it.no} to ${r.actual} (${r.ach}%) from the file? The HOD's figure ${old.actual ? "(" + old.actual + ") " : ""}will be replaced.`, "Use this figure", async () => {
+    const row = { ...old, no: it.no, text: it.text, target: it.target, star: !!it.star, kraNo: it.kraNo, freq: it.freq, files: filesOf(old), actual: r.actual, ach: r.ach, setBy: "md-file-check" };
+    delete row.rag;
+    row.ai = { verdict: "ok", summary: "MD ഓഫീസ് ഫയൽ പരിശോധനയിൽ നിന്നുള്ള കണക്ക്.", proof: { read: true, count: null, matches: true, note: "File check" }, questions: [], at: nowIso() };
+    row.ai.hash = kpiHash(row);
+    const bad = ["A", "R"].includes(statusOf(row));
+    row.done = !bad || ((row.reason || "").trim() && (row.next || "").trim()) ? true : false;
+    const rows = { ...((S.results[c.dept_id] || {}).rows || {}), [kpiId]: row };
+    const { error } = await supabase.rpc("save_kpi", { p_week: c.week, p_dept: c.dept_id, p_kpi: kpiId, p_row: row, p_source: "app", p_complete: progressOf(d, rows, scopeNow()).complete });
+    if (error) return toast("Couldn't save: " + error.message);
+    await loadResults(); render(); toast(`KPI ${it.no} set to ${r.ach}%${row.done ? "" : " — the HOD still needs to add reason & next step"}`);
+  });
 }
 
 /* ---------- weekly list & master ---------- */
@@ -916,6 +1100,18 @@ $("#main").addEventListener("click", async (e) => {
   else if (a === "finish-kpi") finishKpi();
   else if (a === "kpi-check") { if (S.edit && !S.edit.busy) kpiCheck(); }
   else if (a === "save-plan") savePlan();
+  else if (a === "fc-dept") { S.fcDept = b.dataset.dept; LS.set("fcdept", S.fcDept); render(); }
+  else if (a === "fc-pick") fcPick(b.dataset.target);
+  else if (a === "fc-run") { if (!S.fcBusy) fcRun(); }
+  else if (a === "fc-answer") { if (!S.fcBusy) fcAnswer(b.dataset.id); }
+  else if (a === "fc-use") fcUse(b.dataset.id, b.dataset.kpi, b.dataset.value);
+  else if (a === "fc-copy") {
+    const c = S.checks.find((x) => x.id === b.dataset.id); const last = (c.rounds || []).slice(-1)[0] || {};
+    const txt = ((last.result || {}).questions || []).map((q, i) => `${i + 1}. ${q.kpiNo ? "KPI " + q.kpiNo + ": " : ""}${q.q}`).join("\n");
+    try { await navigator.clipboard.writeText(txt); toast("Questions copied"); } catch (e) { toast("Couldn't copy — select the questions and copy them by hand."); }
+  }
+  else if (a === "fc-close") { const c = S.checks.find((x) => x.id === b.dataset.id); if (await run(supabase.from("file_checks").update({ status: c.status === "closed" ? "open" : "closed", updated_at: nowIso() }).eq("id", c.id), c.status === "closed" ? "Re-opened" : "Closed")) { await loadChecks(); render(); } }
+  else if (a === "fc-del") confirmModal("Delete this file check? (The KPI results stay.)", "Delete", async () => { if (await run(supabase.from("file_checks").delete().eq("id", b.dataset.id), "File check deleted")) { await loadChecks(); render(); } });
   else if (a === "my-ppt") makePpt(S.dept);
   else if (a === "ppt") makePpt(null);
   else if (a === "rec") toggleRecording(b.dataset.id, b);
@@ -970,6 +1166,8 @@ $("#main").addEventListener("submit", async (e) => {
   }
 });
 $("#main").addEventListener("input", (e) => {
+  if (e.target.id && e.target.id.startsWith("fcAns-")) S.fcDraft[e.target.id.slice(6)] = e.target.value;
+  if (e.target.id === "fcTitle") S.fcTitle = e.target.value;
   if (e.target.id === "q") { S.q = e.target.value; const pos = e.target.selectionStart; render(); const q = $("#q"); q.focus(); q.setSelectionRange(pos, pos); }
 });
 $("#main").addEventListener("change", (e) => {

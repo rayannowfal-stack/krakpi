@@ -146,7 +146,8 @@ export function buildDeck(PptxGenJS, d) {
         s.addText([{ text: x.ach != null ? x.ach + "%" : "—", options: { fontSize: 22, bold: true, color: c.fg } }, { text: `   ${clean(x.actual, 20)} vs ${clean(x.target, 24)}`, options: { fontSize: 10, color: MUT } }],
           { x: cx + 0.2, y: cy + 0.58, w: 3.75, h: 0.42, fontFace: FONT, valign: "middle" });
         const v = x.ai ? VERD[x.ai.verdict] || VERD.doubt : null; const nf = filesOf(x).length;
-        s.addText(`${v ? "Claude " + v[0] : "Not checked"}${x.ai && x.ai.proof && x.ai.proof.matches === false ? " · proof ≠ figure" : ""}${nf ? `  ·  📎 ${nf}` : ""}`, { x: cx + 0.2, y: cy + 0.96, w: 3.75, h: 0.28, fontSize: 9, color: v ? ST[v[1]].fg : MUT, bold: !!(x.ai && x.ai.proof && x.ai.proof.matches === false), fontFace: FONT });
+        const au = x.audit ? `  ·  📂 file ${clean(x.audit.value, 16)}${x.audit.matches === true ? " ✓" : x.audit.matches === false ? " ✗" : ""}` : "";
+        s.addText(`${v ? "Claude " + v[0] : "Not checked"}${x.ai && x.ai.proof && x.ai.proof.matches === false ? " · proof ≠ figure" : ""}${nf ? `  ·  📎 ${nf}` : ""}${au}`, { x: cx + 0.2, y: cy + 0.96, w: 3.75, h: 0.28, fontSize: 9, color: v ? ST[v[1]].fg : MUT, bold: !!((x.ai && x.ai.proof && x.ai.proof.matches === false) || (x.audit && x.audit.matches === false)), fontFace: FONT });
       });
     }
     // 2) Reason, next step and what Claude found — for Amber/Red and anything Claude doubted

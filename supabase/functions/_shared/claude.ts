@@ -46,7 +46,12 @@ function claudeHeaders(key: string) {
 export async function askClaudeJson(prompt: string, opts: { model: string; maxTokens: number }, attachments: Record<string, unknown>[] = []) {
   const key = Deno.env.get("ANTHROPIC_API_KEY");
   if (!key) throw new HttpError(500, "Claude is not set up: add the ANTHROPIC_API_KEY secret in Supabase.");
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const t0 = Date.now();
+  console.log(`claude: asking ${opts.model} (${attachments.length} file block(s), prompt ${prompt.length} chars)`);
+  let res: Response;
+  try {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
+    signal: AbortSignal.timeout(Number(Deno.env.get("CLAUDE_TIMEOUT_MS") ?? (opts.maxTokens > 4000 ? 300000 : 110000))),
     method: "POST",
     headers: claudeHeaders(key),
     body: JSON.stringify({
@@ -56,7 +61,12 @@ export async function askClaudeJson(prompt: string, opts: { model: string; maxTo
         ? [...attachments, { type: "text", text: prompt + "\n\nReply with the JSON object only — no other text." }]
         : prompt + "\n\nReply with the JSON object only — no other text." }],
     }),
-  });
+    });
+  } catch (e) {
+    console.error(`claude: no answer after ${Date.now() - t0} ms`, e);
+    throw new HttpError(504, "Claude took too long to answer. Try again — or attach a smaller photo / shorter PDF.");
+  }
+  console.log(`claude: HTTP ${res.status} after ${Date.now() - t0} ms`);
   if (!res.ok) {
     const detail = await res.text();
     console.error("Claude API error", res.status, detail);

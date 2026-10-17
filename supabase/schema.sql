@@ -462,11 +462,33 @@ language sql stable security definer set search_path = public as $$
 $$;
 grant execute on function public.kpi_scope() to authenticated;
 
+-- ============ Version 3.1: File check by the MD office ============
+-- The admin uploads a department's KPI file(s); Claude marks the figures on the KPIs and asks questions;
+-- the HOD's answer is uploaded later and Claude checks it. Each upload + answer is a "round".
+create table if not exists public.file_checks (
+  id          uuid primary key default gen_random_uuid(),
+  week        date not null,
+  dept_id     text not null references public.departments(id) on delete cascade,
+  title       text not null default '',
+  rounds      jsonb not null default '[]'::jsonb,   -- [{ at, kind: "file"|"answer", files, answerText, result }]
+  status      text not null default 'open' check (status in ('open','closed')),
+  created_by  uuid references auth.users(id) default auth.uid(),
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+create index if not exists file_checks_week_idx on public.file_checks(week, dept_id);
+alter table public.file_checks enable row level security;
+grant select, insert, update, delete on public.file_checks to authenticated;
+drop policy if exists fc_read on public.file_checks;
+create policy fc_read on public.file_checks for select to authenticated using (public.my_role() in ('admin','viewer'));
+drop policy if exists fc_write on public.file_checks;
+create policy fc_write on public.file_checks for all to authenticated using (public.is_admin()) with check (public.is_admin());
+
 -- ============ Live updates ============
 do $$
 declare t text;
 begin
-  foreach t in array array['departments','kpis','proposals','results','actions','reviews','profiles','job_runs'] loop
+  foreach t in array array['departments','kpis','proposals','results','actions','reviews','profiles','job_runs','file_checks'] loop
     begin
       execute format('alter publication supabase_realtime add table public.%I', t);
     exception when duplicate_object then null;

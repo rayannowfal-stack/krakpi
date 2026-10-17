@@ -15,7 +15,8 @@
 <body>
   <header class="bar" id="bar" hidden>
     <div class="wrap bar-row">
-      <div class="brand"><span>Atlas Maharani Group</span><b>Weekly KPI Review</b></div>
+      <div class="brand"><span>Atlas Maharani Group</span><b>Weekly KPI Review</b><em id="pageTitle"></em></div>
+      <button class="menu-btn" id="menuBtn" aria-label="Menu" aria-expanded="false" aria-controls="drawer"><span></span><span></span><span></span></button>
       <div class="week" role="group" aria-label="Review week">
         <button id="wkPrev" aria-label="Previous week">&lsaquo;</button>
         <div class="wl"><b id="wkMeet">Meeting</b><small id="wkRange">Week</small></div>
@@ -31,6 +32,7 @@
     <nav class="tabs wrap" id="tabs" aria-label="Sections">
       <button data-tab="overview">Overview</button>
       <button data-tab="submit">Results</button>
+      <button data-tab="files">File check</button>
       <button data-tab="weekly">Weekly KPI list</button>
       <button data-tab="master">KRA &amp; KPI</button>
       <button data-tab="pending">Pending points</button>
@@ -39,6 +41,17 @@
       <button data-tab="settings">Settings</button>
     </nav>
   </header>
+  <div class="drawer-bg" id="drawerBg" hidden></div>
+  <aside class="drawer" id="drawer" aria-label="Menu" aria-hidden="true">
+    <div class="drawer-head"><div><b id="dName">—</b><span id="dRole"></span></div><button class="btn small ghost" id="drawerClose" aria-label="Close menu">✕</button></div>
+    <div class="drawer-week"><button class="btn small" id="dPrev" aria-label="Previous week">‹</button><div><b id="dMeet">Meeting</b><small id="dRange"></small></div><button class="btn small" id="dNext" aria-label="Next week">›</button></div>
+    <nav class="drawer-nav" id="dTabs"></nav>
+    <div class="drawer-actions">
+      <button class="btn primary" id="dPpt">Make PPT</button>
+      <button class="btn" id="dPw">🔑 Change password</button>
+      <button class="btn ghost danger" id="dOut">Sign out</button>
+    </div>
+  </aside>
   <main class="wrap" id="main"><div class="empty">Loading…</div></main>
   <div id="modalRoot"></div>
   <script type="module" src="/src/main.js"></script>

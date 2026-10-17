@@ -40,15 +40,25 @@ function claudeHeaders(key) {
 async function askClaudeJson(prompt, opts, attachments = []) {
   const key = Deno.env.get("ANTHROPIC_API_KEY");
   if (!key) throw new HttpError(500, "Claude is not set up: add the ANTHROPIC_API_KEY secret in Supabase.");
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: claudeHeaders(key),
-    body: JSON.stringify({
-      model: opts.model,
-      max_tokens: opts.maxTokens,
-      messages: [{ role: "user", content: attachments.length ? [...attachments, { type: "text", text: prompt + "\n\nReply with the JSON object only \u2014 no other text." }] : prompt + "\n\nReply with the JSON object only \u2014 no other text." }]
-    })
-  });
+  const t0 = Date.now();
+  console.log(`claude: asking ${opts.model} (${attachments.length} file block(s), prompt ${prompt.length} chars)`);
+  let res;
+  try {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
+      signal: AbortSignal.timeout(Number(Deno.env.get("CLAUDE_TIMEOUT_MS") ?? (opts.maxTokens > 4e3 ? 3e5 : 11e4))),
+      method: "POST",
+      headers: claudeHeaders(key),
+      body: JSON.stringify({
+        model: opts.model,
+        max_tokens: opts.maxTokens,
+        messages: [{ role: "user", content: attachments.length ? [...attachments, { type: "text", text: prompt + "\n\nReply with the JSON object only \u2014 no other text." }] : prompt + "\n\nReply with the JSON object only \u2014 no other text." }]
+      })
+    });
+  } catch (e) {
+    console.error(`claude: no answer after ${Date.now() - t0} ms`, e);
+    throw new HttpError(504, "Claude took too long to answer. Try again \u2014 or attach a smaller photo / shorter PDF.");
+  }
+  console.log(`claude: HTTP ${res.status} after ${Date.now() - t0} ms`);
   if (!res.ok) {
     const detail = await res.text();
     console.error("Claude API error", res.status, detail);
@@ -266,41 +276,71 @@ async function logJob(db, job, week, ok, detail) {
 // supabase/functions/_shared/ai.ts
 var RATINGS_MAP = Object.fromEntries(RATINGS.map((r) => [r, true]));
 async function reviewWeek(b) {
-  let payload = JSON.stringify((b.departments || []).slice(0, 30));
-  if (payload.length > 18e4) payload = payload.slice(0, 18e4);
-  const prompt = `You are the analyst for the MD office of Atlas Maharani Group (textile retail, Kerala). Every Monday the heads of department (HODs) present last week's KPI results. The MD wants each department to work in a RESULT-ORIENTED way, not just do its duty. Review this week's sheets and write the MD office's view.
-
-For each department judge:
-- Are results measured outcomes against targets with real data, or activity reports ("done", "checked", "followed up")?
-- Are Amber/Red KPIs explained with a root cause ("reason") and a concrete "nextStep" with owner and date? ("attached" = voice notes/photos/files given as evidence; you cannot open them.)
-- Did the HOD answer Claude's clarification questions properly, or dodge them? (Answers may be in Malayalam.)
-- Trend vs last week's score, overdue actions, KPIs Red two weeks running.
-- A department with a missing sheet should be called out.
-- Each KPI row may carry "claude": what Claude found when the HOD finished that KPI (verdict ok/doubt/weak, and "proof" = what Claude read in the attached photo/PDF, with "matches" true/false against the HOD's figure). A proof that does not match the figure is a serious point for the MD.
-Questions for Monday must be direct and specific to a KPI or figure. Suggestions must be practical for a textile retail chain. Never invent figures not in the data.
-
-LANGUAGE: Write "headline", "groupView", every "watchList" item, every "verdict", every "question", every "suggestion" and every "crossDept" item in simple, clear MALAYALAM (Malayalam script), the way the MD office talks to its managers. Keep numbers, KPI numbers, department names and business terms (ATV, UPT, GP, PO, GRN, KPI) in English inside the Malayalam sentence. "rating" stays exactly one of the three English labels, and "dept" stays the id from the data.
-
-Week: ${str(b.weekLabel, 40)} (meeting ${str(b.meeting, 40)})
-Red two weeks running: ${JSON.stringify(strArr(b.repeatReds, 60))}
-Departments (JSON): ${payload}
-
+  const model = Deno.env.get("CLAUDE_MODEL_REVIEW") ?? "claude-sonnet-5-5";
+  const depts = (b.departments || []).slice(0, 30);
+  const LANG = `LANGUAGE: write every sentence in simple, clear MALAYALAM (Malayalam script), the way the MD office talks to its managers. Keep numbers, KPI numbers, department names and business terms (ATV, UPT, GP, PO, GRN, KPI) in English inside the sentence.`;
+  const RULES = `Judge: are results measured outcomes against targets with real data, or just "work done"? Are Amber/Red KPIs explained with a real root cause ("reason") and a concrete "nextStep" (what, who, by when)? Did the HOD answer Claude's questions properly? "claude" on a KPI = what Claude found when the HOD finished it; "proof.matches": false means the attached photo/PDF does NOT support the figure \u2014 a serious point. Also look at the trend vs last week, overdue actions, unfinished KPIs. Never invent figures.`;
+  const one = async (d) => {
+    if (d.sheet === "missing" || !(d.rows || []).length) return { dept: str(d.id, 80), rating: "Activity only", verdict: "\u0D08 \u0D06\u0D34\u0D4D\u0D1A \u0D08 \u0D35\u0D15\u0D41\u0D2A\u0D4D\u0D2A\u0D4D KPI \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D28\u0D7D\u0D15\u0D3F\u0D2F\u0D3F\u0D1F\u0D4D\u0D1F\u0D3F\u0D32\u0D4D\u0D32.", questions: ["\u0D0E\u0D28\u0D4D\u0D24\u0D41\u0D15\u0D4A\u0D23\u0D4D\u0D1F\u0D3E\u0D23\u0D4D \u0D08 \u0D06\u0D34\u0D4D\u0D1A KPI \u0D31\u0D3F\u0D2A\u0D4D\u0D2A\u0D4B\u0D7C\u0D1F\u0D4D\u0D1F\u0D4D \u0D28\u0D7D\u0D15\u0D3E\u0D24\u0D3F\u0D30\u0D41\u0D28\u0D4D\u0D28\u0D24\u0D4D?"], suggestions: [] };
+    let data = JSON.stringify(d);
+    if (data.length > 4e4) data = data.slice(0, 4e4);
+    const prompt2 = `You are the analyst for the MD office of Atlas Maharani Group (textile retail, Kerala, 24 showrooms). Review ONE department's weekly KPI report for the Monday HOD meeting (week ${str(b.weekLabel, 40)}, meeting ${str(b.meeting, 40)}).
+${RULES}
+Department data: ${data}
+${LANG}
 Reply with only this JSON:
-{"headline":"<one sentence, the most important thing for the MD this week>","groupView":"<3 short sentences on the group overall>","watchList":["<a person, KPI or issue the MD office must follow this week>"],"departments":[{"dept":"<id from the data>","rating":"Result-oriented" | "Partly result-oriented" | "Activity only","verdict":"<2 sentences>","questions":["<question to ask the HOD on Monday>"],"suggestions":["<practical suggestion>"]}],"crossDept":["<issue between departments, e.g. Purchase stock vs Sales availability>"]}
-One entry per department in the data, in the same order. Up to 3 questions and 3 suggestions per department, up to 5 watch-list items, up to 4 cross-department items.`;
-  const res = await askClaudeJson(prompt, { model: Deno.env.get("CLAUDE_MODEL_REVIEW") ?? "claude-opus-5-5", maxTokens: 8e3 });
+{"rating":"Result-oriented" | "Partly result-oriented" | "Activity only","verdict":"<2 short sentences in Malayalam>","questions":["<up to 3 direct questions to ask this HOD on Monday, Malayalam>"],"suggestions":["<up to 2 practical suggestions, Malayalam>"]}`;
+    try {
+      const r = await askClaudeJson(prompt2, { model, maxTokens: 1500 });
+      return { dept: str(d.id, 80), rating: RATINGS.includes(String(r.rating)) ? String(r.rating) : "Partly result-oriented", verdict: str(r.verdict, 600), questions: strArr(r.questions, 3), suggestions: strArr(r.suggestions, 2) };
+    } catch (e) {
+      console.error("review: department failed", d.id, e instanceof Error ? e.message : e);
+      return { dept: str(d.id, 80), rating: "Partly result-oriented", verdict: "Claude-\u0D28\u0D4D \u0D08 \u0D35\u0D15\u0D41\u0D2A\u0D4D\u0D2A\u0D4D \u0D07\u0D2A\u0D4D\u0D2A\u0D4B\u0D7E \u0D35\u0D3F\u0D32\u0D2F\u0D3F\u0D30\u0D41\u0D24\u0D4D\u0D24\u0D3E\u0D28\u0D3E\u0D2F\u0D3F\u0D32\u0D4D\u0D32.", questions: [], suggestions: [] };
+    }
+  };
+  const t0 = Date.now();
+  const out = new Array(depts.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(4, depts.length) }, async () => {
+    while (next < depts.length) {
+      const i = next++;
+      out[i] = await one(depts[i]);
+    }
+  }));
+  console.log(`review: ${depts.length} departments in ${Date.now() - t0} ms`);
+  const brief = depts.map((d, i) => ({
+    dept: d.name,
+    sheet: d.sheet,
+    score: d.score,
+    lastWeekScore: d.lastWeekScore,
+    rating: out[i]?.rating,
+    verdict: out[i]?.verdict,
+    // deno-lint-ignore no-explicit-any
+    red: (d.rows || []).filter((x) => x.status === "Red").map((x) => `${x.no} ${x.kpi}`).slice(0, 8),
+    // deno-lint-ignore no-explicit-any
+    proofMismatch: (d.rows || []).filter((x) => x.claude && x.claude.proof && x.claude.proof.matches === false).map((x) => x.no),
+    // deno-lint-ignore no-explicit-any
+    overdueActions: (d.openActions || []).filter((a) => a.overdue).length
+  }));
+  const prompt = `You are the analyst for the MD office of Atlas Maharani Group (textile retail, Kerala). Write the group view of this week's HOD reports (week ${str(b.weekLabel, 40)}, meeting ${str(b.meeting, 40)}).
+Departments (already reviewed one by one): ${JSON.stringify(brief).slice(0, 3e4)}
+KPIs Red two weeks running: ${JSON.stringify(strArr(b.repeatReds, 40))}
+${LANG}
+Reply with only this JSON:
+{"headline":"<one sentence: the most important thing for the MD this week>","groupView":"<3 short sentences on the group overall>","watchList":["<up to 5 people / KPIs / issues the MD office must follow this week>"],"crossDept":["<up to 3 issues between departments, e.g. Purchase stock vs Sales>"]}`;
+  let g = {};
+  try {
+    g = await askClaudeJson(prompt, { model, maxTokens: 1500 });
+  } catch (e) {
+    console.error("review: group view failed", e instanceof Error ? e.message : e);
+  }
+  console.log(`review: finished in ${Date.now() - t0} ms`);
   return {
-    headline: str(res.headline, 400),
-    groupView: str(res.groupView, 1200),
-    watchList: strArr(res.watchList, 5),
-    crossDept: strArr(res.crossDept, 4),
-    departments: (Array.isArray(res.departments) ? res.departments : []).map((x) => ({
-      dept: str(x.dept, 80),
-      rating: RATINGS.includes(String(x.rating)) ? String(x.rating) : "Partly result-oriented",
-      verdict: str(x.verdict, 600),
-      questions: strArr(x.questions, 3),
-      suggestions: strArr(x.suggestions, 3)
-    }))
+    headline: str(g.headline, 400),
+    groupView: str(g.groupView, 1200),
+    watchList: strArr(g.watchList, 5),
+    crossDept: strArr(g.crossDept, 4),
+    departments: out.filter(Boolean)
   };
 }
 
@@ -323,8 +363,19 @@ Deno.serve(async (req) => {
     const b = await req.json();
     const week = str(b.week, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(week)) throw new HttpError(400, "Missing week.");
-    const data = await review(serviceClient(), week, profile.id);
-    return json({ ok: true, review: data });
+    const db = serviceClient();
+    console.log("ai-review: start", week);
+    const work = review(db, week, profile.id).then(() => console.log("ai-review: saved", week)).catch(async (e) => {
+      console.error("ai-review: failed", e instanceof Error ? e.message : e);
+      await logJob(db, "review", week, false, e instanceof Error ? e.message : String(e));
+    });
+    const rt = globalThis.EdgeRuntime;
+    if (rt && typeof rt.waitUntil === "function") {
+      rt.waitUntil(work);
+      return json({ ok: true, started: true });
+    }
+    await work;
+    return json({ ok: true, started: false });
   } catch (e) {
     const status = e instanceof HttpError ? e.status : 500;
     if (status === 500) console.error(e);
